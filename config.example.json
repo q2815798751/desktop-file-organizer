@@ -1,0 +1,73 @@
+{
+  "categories": [
+    {
+      "name": "办公文件",
+      "extensions": [
+        "doc",
+        "docx",
+        "xls",
+        "xlsx",
+        "csv",
+        "pdf"
+      ],
+      "folder": "办公文件",
+      "subtypes": {
+        "Word文档": [
+          "doc",
+          "docx"
+        ],
+        "Excel表格": [
+          "xls",
+          "xlsx",
+          "csv"
+        ],
+        "PDF文件": [
+          "pdf"
+        ]
+      }
+    },
+    {
+      "name": "压缩包",
+      "extensions": [
+        "zip",
+        "rar",
+        "7z"
+      ],
+      "folder": "压缩包"
+    },
+    {
+      "name": "文本文件",
+      "extensions": [
+        "txt",
+        "md",
+        "log"
+      ],
+      "folder": "文本文件"
+    },
+    {
+      "name": "图片",
+      "extensions": [
+        "jpg",
+        "jpeg",
+        "png",
+        "gif",
+        "bmp",
+        "svg"
+      ],
+      "folder": "图片"
+    },
+    {
+      "name": "其他",
+      "extensions": [],
+      "folder": "其他"
+    }
+  ],
+  "panels": [],
+  "desktop_path": "",
+  "storage_path": "",
+  "auto_start": false,
+  "initialized": false,
+  "theme": "emerald",
+  "panel_opacity": 1.0,
+  "font_scale": 1.0
+}
