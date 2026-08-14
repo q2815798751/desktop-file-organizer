@@ -28,6 +28,17 @@
 pip install -r requirements.txt
 ```
 
+## 打包与分发（可选）
+
+用 PyInstaller 打包成免安装的单目录可执行程序：
+
+```bash
+pip install pyinstaller
+python -m PyInstaller --windowed --name DesktopFileOrganizer --icon app_icon.ico --onedir main.py
+```
+
+产物在 `dist/DesktopFileOrganizer/`，可直接运行 `DesktopFileOrganizer.exe`；也可把该目录压缩成安装包分发。桌面快捷方式指向该 exe 并使用 `app_icon.ico` 作为图标。
+
 ## 使用
 
 ```bash
