@@ -11,7 +11,7 @@ from PyQt5.QtWidgets import (
     QMenu, QMessageBox, QInputDialog, QApplication, QComboBox,
     QHeaderView, QTreeWidget, QTreeWidgetItem, QStackedWidget,
     QAbstractItemView, QStatusBar, QMainWindow, QDialog,
-    QDialogButtonBox, QSlider,
+    QDialogButtonBox, QSlider, QSizePolicy,
 )
 
 from themes import get as _get_theme
@@ -20,7 +20,7 @@ import icons
 # ── 颜色（由主题模块驱动） ───────────────────────────────────
 RADIUS = 10                   # 容器/表面圆角
 RADIUS_SM = 8                 # 紧凑控件圆角
-FONT = '"Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif'
+FONT = '"Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif'
 
 
 def _set_colors(c):
@@ -51,8 +51,8 @@ _set_colors(_get_theme())  # 默认主题
 # ── 全局样式 ─────────────────────────────────────────────
 
 def _fs(base, scale=1.0):
-    """按字号比例缩放，保留最小可读字号。"""
-    return max(9, int(base * scale))
+    """按字号比例缩放；基础再上浮 2px，营造更接近苹果的大字阅读感。"""
+    return max(9, int((base + 2) * scale))
 
 
 def _build_dashboard_style(font_scale=1.0):
@@ -65,17 +65,17 @@ QMainWindow, QWidget#CentralWidget {{
     font-family: {FONT};
 }}
 
-/* ── 侧边栏 ── */
+/* ── 侧边栏（无硬边框，靠背景明暗区分） ── */
 QWidget#Sidebar {{
     background: {BG_SIDEBAR};
-    border-right: 1px solid {BORDER};
+    border: none;
 }}
 
 QLabel#SidebarTitle {{
     color: {TEXT_MUTED};
     font-size: {_fs(11, s)}px;
     font-weight: 600;
-    padding: 16px 16px 6px 16px;
+    padding: 18px 18px 8px 18px;
 }}
 
 QPushButton#CategoryItem {{
@@ -155,12 +155,11 @@ QTreeWidget::branch {{
     background: transparent;
 }}
 QHeaderView::section {{
-    background: {BG_SIDEBAR};
+    background: rgba({ACCENT_RGB}, 0.06);
     color: {TEXT_MUTED};
     border: none;
-    border-bottom: 1px solid {BORDER};
-    padding: 9px 12px;
-    font-weight: 600;
+    padding: 11px 14px;
+    font-weight: 700;
     font-size: {_fs(11, s)}px;
 }}
 
@@ -260,13 +259,13 @@ QComboBox QAbstractItemView {{
     outline: none;
 }}
 
-/* ── 状态栏 ── */
+/* ── 状态栏（无硬边框，靠背景区分） ── */
 QStatusBar {{
     background: {BG_SIDEBAR};
     color: {TEXT_SECONDARY};
-    border-top: 1px solid {BORDER};
+    border: none;
     font-size: {_fs(11, s)}px;
-    padding: 4px 12px;
+    padding: 5px 14px;
 }}
 
 /* ── 弹窗与输入框（QInputDialog / QMessageBox）── */
@@ -296,6 +295,32 @@ QPushButton {{
 }}
 QPushButton:hover {{ background: {BG_SURFACE_ALT}; border-color: {TEXT_MUTED}; }}
 QPushButton:pressed {{ background: {BG_MAIN}; padding-top: 8px; }}
+
+/* ── 悬浮式滚动条（近透明，自隐藏感） ── */
+QScrollBar:vertical {{
+    background: transparent; width: 9px; margin: 2px 2px 2px 0;
+}}
+QScrollBar::handle:vertical {{
+    background: rgba({ACCENT_RGB}, 0.30); border-radius: 4px; min-height: 32px;
+}}
+QScrollBar::handle:vertical:hover {{ background: rgba({ACCENT_RGB}, 0.50); }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; background: transparent; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+
+QScrollBar:horizontal {{
+    background: transparent; height: 9px; margin: 0 2px 2px 2px;
+}}
+QScrollBar::handle:horizontal {{
+    background: rgba({ACCENT_RGB}, 0.30); border-radius: 4px; min-width: 32px;
+}}
+QScrollBar::handle:horizontal:hover {{ background: rgba({ACCENT_RGB}, 0.50); }}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; background: transparent; }}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: transparent; }}
+
+/* ── 分栏拖拽手柄：透明，悬停才显现 ── */
+QSplitter::handle {{ background: transparent; }}
+QSplitter::handle:horizontal {{ width: 7px; }}
+QSplitter::handle:hover {{ background: rgba({ACCENT_RGB}, 0.16); }}
 """
 
 
@@ -356,6 +381,101 @@ class _DropCategoryList(QListWidget):
             self.on_drop_category(item.data(Qt.UserRole), paths)
         event.acceptProposedAction()
 
+    def resizeEvent(self, event):
+        """行宽随分类列表宽度自适应（嵌入的行控件铺满整行）。"""
+        super().resizeEvent(event)
+        w = self.viewport().width()
+        if w <= 0:
+            return
+        for i in range(self.count()):
+            it = self.item(i)
+            if it is not None and it.sizeHint().width() != w:
+                it.setSizeHint(QSize(w, it.sizeHint().height()))
+
+
+class _CategoryRow(QWidget):
+    """侧边栏分类行：文件夹图标 + 名称/计数 + 该分类的桌面面板开关。"""
+
+    def __init__(self, category_list, panel_manager, cat_name, count, parent=None):
+        super().__init__(parent)
+        self._list = category_list
+        self._panel_manager = panel_manager
+        self._cat_name = cat_name
+
+        self.setObjectName("CategoryRow")
+        self.setFixedHeight(46)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 5, 12, 5)
+        lay.setSpacing(8)
+
+        self._icon = QLabel()
+        self._icon.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._icon.setPixmap(icons.folder(TEXT_SECONDARY).pixmap(18, 18))
+        lay.addWidget(self._icon)
+
+        # 名称标签：允许被压缩到剩余宽度，超宽用省略号，避免被右侧按钮顶出
+        self._full_text = f"{cat_name}  {count}"
+        self._label = QLabel()
+        self._label.setObjectName("CategoryRowLabel")
+        self._label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._label.setTextInteractionFlags(Qt.NoTextInteraction)
+        self._label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        lay.addWidget(self._label, 1)
+
+        self._panel_btn = QPushButton()
+        self._panel_btn.setObjectName("CategoryPanelBtn")
+        self._panel_btn.setCheckable(True)
+        self._panel_btn.setCursor(Qt.PointingHandCursor)
+        self._panel_btn.clicked.connect(self._on_toggle_panel)
+        lay.addWidget(self._panel_btn)
+
+        self.refresh_state()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._elide_label()
+
+    def _elide_label(self):
+        """名称过长时用省略号截断，保持右侧面板按钮不遮挡文字。"""
+        fm = self._label.fontMetrics()
+        w = self._label.width()
+        if w > 0 and fm.horizontalAdvance(self._full_text) > w:
+            self._label.setText(fm.elidedText(self._full_text, Qt.ElideRight, w))
+        else:
+            self._label.setText(self._full_text)
+
+    def refresh_state(self):
+        """按面板当前显隐更新开关按钮状态。"""
+        shown = self._panel_manager.is_panel_shown(self._cat_name) if self._panel_manager else False
+        self._panel_btn.setChecked(shown)
+        self._panel_btn.setText("面板 ●" if shown else "面板 ○")
+        self._panel_btn.setToolTip("关闭该分类的桌面面板" if shown else "打开该分类的桌面面板")
+
+    def set_selected(self, sel):
+        """标记当前选中的分类行（强调色左边条 + 高亮文字）。"""
+        self.setProperty("sel", "true" if sel else "false")
+        self.style().unpolish(self)
+        self.style().polish(self)
+        color = ACCENT_HOVER if sel else TEXT_SECONDARY
+        self._icon.setPixmap(icons.folder(color).pixmap(16, 16))
+
+    def _on_toggle_panel(self, _checked):
+        if self._panel_manager:
+            self._panel_manager.toggle_panel(self._cat_name)
+
+    def _row_index(self):
+        for i in range(self._list.count()):
+            if self._list.itemWidget(self._list.item(i)) is self:
+                return i
+        return 0
+
+    def mousePressEvent(self, event):
+        # 点击行（开关按钮之外的区域）→ 选中该分类
+        self._list.setCurrentRow(self._row_index())
+        super().mousePressEvent(event)
+
 
 class Dashboard(QMainWindow):
     """文件管理仪表盘主窗口。"""
@@ -376,12 +496,17 @@ class Dashboard(QMainWindow):
         self._current_category = None
         self._current_subtype = None  # 办公文件等分类的内部子类型筛选
         self._all_files_cache = []  # [(full_path, name, mtime, category_name)]
+        self._category_rows = {}  # category_name -> _CategoryRow
 
         # 应用当前主题与字号
         self._apply_theme(_get_theme(config.get("theme")))
 
         self._setup_ui()
         self._load_categories()
+
+        # 面板显隐变化 → 刷新每行开关 + 全局开关 + 状态栏
+        if self.panel_manager is not None:
+            self.panel_manager.panel_state_changed.connect(self._on_panel_state_changed)
 
         # 默认选中第一个分类
         if self.config["categories"]:
@@ -409,7 +534,7 @@ class Dashboard(QMainWindow):
         self._search_bar = QLineEdit()
         self._search_bar.setObjectName("SearchBar")
         self._search_bar.setPlaceholderText("搜索文件…")
-        self._search_bar.setFixedHeight(40)
+        self._search_bar.setFixedHeight(44)
         self._search_bar.textChanged.connect(self._on_search)
         search_wrapper = QWidget()
         search_wrapper.setStyleSheet(f"background: {BG_MAIN};")
@@ -437,10 +562,11 @@ class Dashboard(QMainWindow):
         # ── 主体：侧边栏 + 文件区 ──
         splitter = QSplitter(Qt.Horizontal)
 
-        # 左侧边栏
+        # 左侧边栏（可拖动调宽）
         self._sidebar = QWidget()
         self._sidebar.setObjectName("Sidebar")
-        self._sidebar.setFixedWidth(200)
+        self._sidebar.setMinimumWidth(180)
+        self._sidebar.setMaximumWidth(440)
         sidebar_layout = QVBoxLayout(self._sidebar)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
         sidebar_layout.setSpacing(0)
@@ -574,6 +700,9 @@ class Dashboard(QMainWindow):
 
         splitter.addWidget(right)
         splitter.setStretchFactor(1, 1)
+        splitter.setSizes([230, 730])     # 初始：侧边栏宽 230
+        splitter.setCollapsible(0, False) # 侧边栏不会被拖到消失
+        splitter.setHandleWidth(7)
 
         main_layout.addWidget(splitter, 1)
 
@@ -617,6 +746,47 @@ class Dashboard(QMainWindow):
                 font-weight: 600;
             }}
         """
+
+    def _category_row_style(self, s=None):
+        """侧边栏分类行（嵌入行控件）的样式：悬停/选中 + 每行面板开关。"""
+        s = s or self._font_scale
+        return f"""
+            QWidget#CategoryRow {{ background: transparent; border-left: 3px solid transparent; }}
+            QWidget#CategoryRow:hover {{ background: {BG_SURFACE_ALT}; }}
+            QWidget#CategoryRow[sel="true"] {{
+                background: rgba({ACCENT_RGB}, 0.12); border-left: 3px solid {ACCENT};
+            }}
+            QLabel#CategoryRowLabel {{ color: {TEXT_SECONDARY}; font-size: {_fs(13, s)}px; }}
+            QWidget#CategoryRow[sel="true"] QLabel#CategoryRowLabel {{
+                color: {ACCENT_HOVER}; font-weight: 600;
+            }}
+            QPushButton#CategoryPanelBtn {{
+                background: transparent; color: {TEXT_SECONDARY};
+                border: 1px solid {BORDER}; border-radius: {RADIUS_SM}px;
+                padding: 3px 8px; font-size: {_fs(11, s)}px; font-weight: 600;
+            }}
+            QPushButton#CategoryPanelBtn:hover {{ background: {BG_SURFACE_ALT}; color: {TEXT_PRIMARY}; }}
+            QPushButton#CategoryPanelBtn:checked {{
+                background: {ACCENT}; color: {ACCENT_TEXT}; border-color: {ACCENT};
+            }}
+            QPushButton#CategoryPanelBtn:checked:hover {{ background: {ACCENT_HOVER}; }}
+        """
+
+    def _on_panel_state_changed(self):
+        """任一面板显隐变化 → 刷新每行开关、全局开关、状态栏。"""
+        for row in self._category_rows.values():
+            row.refresh_state()
+        self._sync_panel_toggle()
+        if hasattr(self, "_status_bar"):
+            self._update_status()
+
+    def _sync_panel_toggle(self):
+        """全局「桌面面板」开关文案随实际显隐联动。"""
+        if not hasattr(self, "_panel_toggle_btn"):
+            return
+        any_on = bool(self.panel_manager and self.panel_manager.any_panel_shown())
+        self._panel_toggle_btn.setChecked(any_on)
+        self._panel_toggle_btn.setText("● 桌面面板已开启" if any_on else "○ 桌面面板已关闭")
 
     def _apply_theme(self, colors):
         """更新配色全局与字号，并重建已创建控件的样式。"""
@@ -737,8 +907,10 @@ class Dashboard(QMainWindow):
         fs_combo.addItem("小", 0.85)
         fs_combo.addItem("中", 1.0)
         fs_combo.addItem("大", 1.15)
+        fs_combo.addItem("特大", 1.3)
+        fs_combo.addItem("超大", 1.5)
         cur_fs = round(float(self.config.get("font_scale", 1.0) or 1.0), 2)
-        fs_combo.setCurrentIndex({0.85: 0, 1.0: 1, 1.15: 2}.get(cur_fs, 1))
+        fs_combo.setCurrentIndex({0.85: 0, 1.0: 1, 1.15: 2, 1.3: 3, 1.5: 4}.get(cur_fs, 1))
         layout.addWidget(fs_combo)
 
         btn_box = QDialogButtonBox()
@@ -784,14 +956,21 @@ class Dashboard(QMainWindow):
 
     def _load_categories(self):
         self._category_list.clear()
+        self._category_rows = {}
         from file_manager import get_files_in_category
 
         for cat in self.config["categories"]:
             count = len(get_files_in_category(self.config, cat))
-            item = QListWidgetItem(f"{cat['name']}  {count}")
+            row = _CategoryRow(self._category_list, self.panel_manager, cat["name"], count)
+            row.setStyleSheet(self._category_row_style())
+            self._category_rows[cat["name"]] = row
+
+            item = QListWidgetItem()
             item.setData(Qt.UserRole, cat["name"])
-            item.setIcon(icons.folder(TEXT_SECONDARY))
+            item.setSizeHint(row.sizeHint())
             self._category_list.addItem(item)
+            self._category_list.setItemWidget(item, row)
+            row.set_selected(False)
 
     def _select_category(self, name):
         """程序化选中某个分类。"""
@@ -812,6 +991,9 @@ class Dashboard(QMainWindow):
             self._setup_type_filter(cat)
             self._load_files(cat)
             self._update_status()
+            # 同步侧边栏行的选中样式（强调左边条）
+            for n, r in self._category_rows.items():
+                r.set_selected(n == name)
 
     def _setup_type_filter(self, cat):
         """按分类的子类型配置填充筛选下拉框。"""
@@ -854,6 +1036,14 @@ class Dashboard(QMainWindow):
 
         del_action = menu.addAction("删除分类")
         del_action.triggered.connect(lambda: self._on_remove_category(cat_name))
+
+        menu.addSeparator()
+
+        panel_label = "关闭桌面面板" if self.panel_manager.is_panel_shown(cat_name) else "打开桌面面板"
+        panel_action = menu.addAction(panel_label)
+        panel_action.triggered.connect(
+            lambda: self.panel_manager.toggle_panel(cat_name) if self.panel_manager else None
+        )
 
         menu.exec_(self._category_list.mapToGlobal(pos))
 
@@ -1144,10 +1334,13 @@ class Dashboard(QMainWindow):
             self._load_files(self._current_category)
 
     def refresh_all_data(self):
-        """完全刷新：分类列表 + 文件列表。"""
+        """完全刷新：分类列表 + 文件列表 + 面板开关联动。"""
         self._load_categories()
+        self._sync_panel_toggle()
         if self._current_category:
             self._load_files(self._current_category)
+            for n, r in self._category_rows.items():
+                r.set_selected(n == self._current_category["name"])
         self._update_status()
 
     # ═══════════════════════════════════════════════════════
@@ -1332,10 +1525,9 @@ class Dashboard(QMainWindow):
         # 开关配色由 QSS 的 #PanelToggle:checked 控制，这里只改文案
         if checked:
             self.panel_manager.show_all()
-            self._panel_toggle_btn.setText("● 桌面面板已开启")
         else:
             self.panel_manager.hide_all()
-            self._panel_toggle_btn.setText("○ 桌面面板已关闭")
+        self._sync_panel_toggle()
         self.panels_toggled.emit(checked)
 
     # ═══════════════════════════════════════════════════════
@@ -1365,10 +1557,10 @@ class Dashboard(QMainWindow):
                     if os.path.isfile(os.path.join(folder, f))
                 ])
 
-        panels_on = self._panel_toggle_btn.isChecked()
+        panels_on = self.panel_manager.shown_count() if self.panel_manager else 0
         self._status_bar.showMessage(
             f"  {total_cats} 个分类 | {actual_total} 个文件 | "
-            f"桌面面板: {'● 开启' if panels_on else '○ 关闭'}"
+            f"桌面面板: {panels_on}/{total_cats} 开启"
         )
 
     def _type_icon(self, full_path, name):

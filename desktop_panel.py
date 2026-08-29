@@ -20,7 +20,7 @@ import icons
 
 # ── 颜色（由主题模块驱动） ─────────────────────────────────
 RADIUS = 10
-FONT = '"Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif'
+FONT = '"Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", sans-serif'
 
 BG_COLOR = QColor(28, 30, 35)
 BORDER_COLOR = QColor(42, 45, 52)
@@ -54,8 +54,8 @@ _set_colors(_get_theme())  # 默认主题
 
 
 def _fs(base, scale=1.0):
-    """按字号比例缩放。"""
-    return max(9, int(base * scale))
+    """按字号比例缩放；基础再上浮 2px，营造更接近苹果的大字阅读感。"""
+    return max(9, int((base + 2) * scale))
 
 
 def _build_panel_style(font_scale=1.0):
@@ -122,6 +122,17 @@ QPushButton#DragHandle {{
     font-size: {_fs(10, s)}px;
     min-width: 20px; max-width: 20px;
 }}
+
+/* ── 悬浮式滚动条（近透明，自隐藏感） ── */
+QScrollBar:vertical {{
+    background: transparent; width: 8px; margin: 2px;
+}}
+QScrollBar::handle:vertical {{
+    background: rgba({_ACCENT_RGB}, 0.30); border-radius: 4px; min-height: 30px;
+}}
+QScrollBar::handle:vertical:hover {{ background: rgba({_ACCENT_RGB}, 0.50); }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; background: transparent; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
 """
 
 

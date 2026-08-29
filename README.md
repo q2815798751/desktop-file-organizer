@@ -12,6 +12,8 @@
 - **桌面悬浮面板**：每个分类一个面板，**置底不遮挡其他应用窗口**；面板可**磁吸对齐**（靠近自动贴边）并**编组整体拖动**。
 - **拖拽收纳**：把资源管理器里的文件/文件夹直接拖到面板或仪表盘上，即移入该分类。
 - **仪表盘**：分类管理、全库搜索、办公文件按 Word/Excel/PDF 子类型筛选、新建分类/文件夹、删除（进回收站）。
+- **独立面板开关**：仪表盘侧边栏每个分类都有「面板 ●/○」开关，可单独显示/隐藏该分类的悬浮面板；侧边栏可左右拖宽，超长分类名自动省略不遮挡。
+- **苹果风界面**：悬浮式半透明自动隐藏滚动条、更大更清晰的字号（0.85–1.5 五档）、柔和无硬边框布局。
 - **10 套主题**：仪表盘 + 悬浮面板 + 托盘全局换肤，另可调**面板透明度**与**字号**。
 - **桌面整洁**：分类文件夹存放在桌面外的存储目录（默认 `文档\桌面文件收纳`），桌面只留快捷方式。
 - **桌面图标自动排列**：启动时把桌面图标对齐到网格。
@@ -28,16 +30,21 @@
 pip install -r requirements.txt
 ```
 
-## 打包与分发（可选）
+## 打包与分发
 
-用 PyInstaller 打包成免安装的单目录可执行程序：
+用 PyInstaller 打包成**免安装的单个可执行文件**（单文件，双击即用）：
 
 ```bash
 pip install pyinstaller
-python -m PyInstaller --windowed --name DesktopFileOrganizer --icon app_icon.ico --onedir main.py
+python -m PyInstaller --onefile --windowed --name DesktopFileOrganizer --icon app_icon.ico main.py
 ```
 
-产物在 `dist/DesktopFileOrganizer/`，可直接运行 `DesktopFileOrganizer.exe`；也可把该目录压缩成安装包分发。桌面快捷方式指向该 exe 并使用 `app_icon.ico` 作为图标。
+产物为单个 `dist/DesktopFileOrganizer.exe`（约 38 MB）。本仓库同时提供：
+
+- 项目根目录快捷方式 `桌面文件收纳.lnk` → 指向该 exe，双击即可打开（图标用 `app_icon.ico`）。
+- 便携安装包 `dist/DesktopFileOrganizer-安装包.zip`（含 exe 与使用说明，解压即用；不含本机 `config.json`）。
+
+> 注：PyInstaller 单文件版偶被部分杀毒软件误报。打包时若需规避，可改用 `--onedir`（产物在 `dist/DesktopFileOrganizer/`）。
 
 ## 使用
 
@@ -93,7 +100,7 @@ python main.py
 | `storage_path` | 分类存储根目录 |
 | `theme` | 当前主题（见 `themes.py`） |
 | `panel_opacity` | 面板透明度 0.5–1.0 |
-| `font_scale` | 字号比例 0.85 / 1.0 / 1.15 |
+| `font_scale` | 字号比例 0.85 / 1.0 / 1.15 / 1.3 / 1.5 |
 | `auto_start` | 是否开机自启 |
 | `initialized` | 是否已完成首次文件归类 |
 

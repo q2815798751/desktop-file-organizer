@@ -13,3 +13,6 @@ assets/
 dist/
 build/
 *.spec
+
+# 本机快捷方式（指向本地 exe，不入库）
+*.lnk
