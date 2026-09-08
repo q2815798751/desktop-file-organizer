@@ -16,6 +16,7 @@
 - **苹果风界面**：悬浮式半透明自动隐藏滚动条、更大更清晰的字号（0.85–1.5 五档）、柔和无硬边框布局。
 - **10 套主题**：仪表盘 + 悬浮面板 + 托盘全局换肤，另可调**面板透明度**与**字号**。
 - **桌面整洁**：分类文件夹存放在桌面外的存储目录（默认 `文档\桌面文件收纳`），桌面只留快捷方式。
+- **首次安装可选存储目录**：首次运行弹出「选择文件收纳的存储位置」，可浏览选择任意目录（如 `E:\beifen\桌面文件收纳`）；不做选择则默认使用系统文档目录。
 - **桌面图标自动排列**：启动时把桌面图标对齐到网格。
 
 ## 环境要求
@@ -43,6 +44,7 @@ python -m PyInstaller --onefile --windowed --name DesktopFileOrganizer --icon ap
 
 - 项目根目录快捷方式 `桌面文件收纳.lnk` → 指向该 exe，双击即可打开（图标用 `app_icon.ico`）。
 - 便携安装包 `dist/DesktopFileOrganizer-安装包.zip`（含 exe 与使用说明，解压即用；不含本机 `config.json`）。
+- Inno Setup 安装程序 `dist/DesktopFileOrganizer-安装程序.exe`（安装向导 + 开始菜单/桌面快捷方式 + 卸载项；安装到用户目录，免管理员）。脚本见 `installer/DesktopFileOrganizer.iss`，编译：`ISCC.exe installer\DesktopFileOrganizer.iss`。
 
 > 注：PyInstaller 单文件版偶被部分杀毒软件误报。打包时若需规避，可改用 `--onedir`（产物在 `dist/DesktopFileOrganizer/`）。
 
@@ -54,7 +56,7 @@ python main.py
 
 启动后：
 
-1. 首次运行会在存储目录（默认 `文档\桌面文件收纳`）创建分类文件夹。
+1. **首次运行**弹出「选择文件收纳的存储位置」：选任意目录，或直接确定使用默认（系统文档 `文档\桌面文件收纳`）。随后在存储目录创建分类文件夹。
 2. 桌面上出现各分类的**悬浮面板**，系统托盘出现图标。
 3. **双击托盘图标**打开仪表盘；托盘右键可显示/隐藏面板、新建分类、开关开机自启、退出。
 
@@ -80,7 +82,7 @@ python main.py
 | 图片 | jpg, jpeg, png, gif, bmp, svg |
 | 其他 | 手动整理（存放项目文件夹等，不自动归类） |
 
-分类文件夹存放在 **存储目录**（默认 `C:\Users\<用户名>\Documents\桌面文件收纳`），可通过 `config.json` 的 `storage_path` 自定义。桌面本身只保留快捷方式。
+分类文件夹存放在 **存储目录**（默认 `C:\Users\<用户名>\Documents\桌面文件收纳`），可通过 `config.json` 的 `storage_path` 自定义，或**首次安装时在选择对话框中直接指定**。桌面本身只保留快捷方式。
 
 ## 主题
 

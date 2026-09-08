@@ -25,6 +25,7 @@ from file_watcher import DesktopWatcher
 from panel_manager import PanelManager
 from dashboard import Dashboard
 from themes import get as _get_theme
+from setup import ensure_storage_path
 import icons
 
 
@@ -92,6 +93,8 @@ class MainApp:
 
         # 配置
         self.config = load_config()
+        # 首次安装：选择分类存储目录（默认系统文档\桌面文件收纳）
+        ensure_storage_path(self.config)
         self.desktop_path = get_desktop_path(self.config)
 
         # 初始化分类文件夹（分类文件夹位于桌面外的存储目录，桌面保持整洁）
