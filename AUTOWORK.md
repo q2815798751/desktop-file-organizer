@@ -123,6 +123,12 @@
       `tempfile.TemporaryDirectory()`，未在真实桌面验证，仓库根目录未生成 `config.json`。
 
 - [ ] **AW-2 修 `_resolve_conflict` 的 TOCTOU 与 `shutil.move` 静默失败（数据安全）**
+      ⚠️ **前置要求（AW-0/AW-1 两次复查都点名的覆盖缺口，必须先补）**：
+      **`init_folders` 的 `first_run=True` 分支（真正执行搬移的那条）仍零覆盖**、
+      `_move_matching_files` 零覆盖、`get_files_in_category` 零覆盖。
+      这一项要动的正是「移动失败怎么报」，而失败路径的宿主函数没测过。
+      所以**先补这几个函数的用例（含「移动失败」路径），确认描述的是旧行为、是绿的，再改代码**。
+      这几条不补，后面任何动 `init_folders` 的改动都是裸奔。
       问题：`file_manager.py:170-183` 先查存在再返回目标名，与随后的
       `shutil.move` 之间有竞态窗口；且 `file_manager.py:88-89` / `129-130` / `166-167`
       一律 `except: pass`，**移动失败用户完全看不到**。
@@ -130,6 +136,31 @@
       调用方（`init_folders` / `_move_matching_files`）据此统计失败数。
       新增用例：目标已存在同名文件 → 断言重命名到 `name (1).ext` 且原文件保留；
       模拟 `shutil.move` 抛 `OSError` → 断言返回失败结果而不是静默吞掉。
+
+- [ ] **AW-15 加固「配置损坏」的回退方向（AW-1 复查实测出的隐患，数据安全）**
+      > 编号是后补的，但**位置在此处表示它比 AW-3 及之后的所有条目优先**。
+
+      AW-1 的对抗性复查**实测**出两个隐患，AW-1 本身没覆盖：
+      **(a) 回退方向是错的（真正的问题）**。`load_config` 解析失败时最终回退成
+      `initialized=False`，而 `False` 的语义是「从没运行过」→ `init_folders` 会**二次搬移整个桌面**。
+      但**配置文件存在**这件事本身就证明跑过一次。
+      实测：把配置**截断在 `initialized` 之前**（这正是**旧的非原子写最可能产生的损坏形态**），
+      正则抢救返回 `None` → 回退 `False` → **二次搬移确实发生了**。
+      修法：**区分「文件不存在」和「文件存在但读不出来」**。只有前者才是首次运行；
+      后者应保守地按「跑过」处理（不要触发首次搬移）。
+      **这比正则抢救可靠得多——抢救应降级成「尽力而为的补充」，而不是主防线。**
+      **(b) `_salvage_initialized` 会被无关的嵌套键骗到**。它用 `re.search` 取**第一个**匹配
+      且**不分层级**。实测：
+      - `{"nested": {"initialized": false}, "initialized": true, ...}` → 抢救出 **False**（**危险方向**）
+      - `{"nested": {"initialized": true}, "initialized": false, ...}` → 抢救出 **True**
+      修法：只扫**顶层键**（限定第一个 `{` 之后的深度 0）；若按 (a) 改完抢救不再必要，
+      直接删掉它更好——**少一段会骗人的代码**。
+      新增用例：截断在 `initialized` 之前的配置 → 断言**不二次搬移**；
+      嵌套 `initialized` 在前/在后两种 → 断言不被骗；**配置文件不存在 → 断言仍按首次运行处理**
+      （这条不能改坏，否则新装用户第一次跑就不搬文件了）；二进制/无法解码的配置 → 断言不二次搬移。
+      ⚠️ 同时把 AW-0/AW-1 复查点名的覆盖缺口一并补上：
+      **`init_folders` 的 `first_run=True` 分支**、`_move_matching_files`、`get_files_in_category`。
+      （如果 AW-2 已经补过，这里只需确认并补漏。）
 
 - [ ] **AW-3 修分类 `folder` 字段的路径越界（数据安全）**
       问题：`file_manager.py:30-33` 直接 `os.path.join(storage_root, folder)`，
