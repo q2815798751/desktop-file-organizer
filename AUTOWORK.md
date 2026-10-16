@@ -24,6 +24,11 @@
    - **绝不**对真实 `~/Desktop`、真实 `~/Documents/桌面文件收纳` 或任何真实用户目录做写操作。
    - 所有涉及移动/删除/重命名的测试，**必须在 `tempfile.TemporaryDirectory()` 里造目录**，
      用 `unittest.mock.patch` 打桩 `get_desktop_path` / `get_storage_root`。
+   - ⚠️ **`config.json` 地雷**：`init_folders` 会调 `save_config`，而 `config.py:13` 的
+     `CONFIG_PATH` 在非打包状态下指向**仓库根目录**下的 `config.json`。任何测试只要碰到
+     `init_folders` / `save_config`，**必须先 `mock.patch("config.CONFIG_PATH", <临时路径>)`**，
+     否则会往仓库根目录写真实配置文件。**每次跑完测试后 `git status` 必须干净**——
+     出现 `config.json` 就是踩了这颗雷，立刻清掉并补打桩。
    - 需要人工确认「程序能跑起来」的条目，只做**静态检查**（`python -m py_compile`）或
      在临时目录上跑，并在条目里写明**没有**在真实桌面上验证。
 6. **同一项连续失败两次**就标记 `BLOCKED` 并写清原因，跳到下一项，不要死磕。
@@ -46,6 +51,27 @@
   「配置损坏导致二次搬移」最危险。
 - 本作业单的顺序是刻意排的：**先建可验证性，再修数据安全问题，然后正确性，最后健壮性/打磨**。
   不要跳着做——后面每一项的验证都依赖 AW-0 建的测试基建。
+
+## 已做过的对抗性复查（不要重复做，但要知道盲区）
+
+**AW-0 的复查结论（2026-10-17 独立 agent，结论：够格）**：
+- 36 个用例真绿、**真能抓回归**（4 种不同的逻辑破坏分别让 6 / 1 / 1 / 1 个用例变红）；
+- **确实不碰真实目录**：插桩监控了 361 次写操作，落在真实家目录的 **0 次**；
+- `master` 未动（仍 `9476d9d`），改动只限 `tests/`、`README.md`、`AUTOWORK.md`，无运行产物污染。
+
+**⚠️ 必须知道的盲区（直接影响 AW-1/AW-2）**：
+1. **`init_folders` / `_move_matching_files` 零覆盖**——这是**最高风险**的函数
+   （会真实移动桌面文件，并调 `save_config` 往仓库根写 `config.json`）。
+   当前仓库根没有 `config.json` **只是因为没测它**，不是因为测试挡住了它。
+2. **`save_config` / `load_config` 零覆盖**——而 **AW-1 要改的正是这两个**。
+   所以 AW-1 必须**先补测再改**（见 AW-1 条目里的前置要求）。
+3. `get_files_in_category` 零覆盖。
+4. 小瑕疵：`move_into_category` 的跨盘符 `ValueError` 分支未测；
+   `test_result_is_inside_folder` / `test_other_desktop_files_untouched` 断言偏弱
+   （只查存在性，没查内容）；`test_name_conflict_renames_on_move` 没像 categorize 版本
+   那样校验原文件内容保留。**后续碰到这些函数时可以顺手补强**，但不要为了凑数而改。
+5. 澄清一条：实现产物是**无空格**的 `name(1).ext`。如果哪个条目里写成了
+   `name (1).ext`（带空格），那是描述笔误，**以代码行为为准**。
 
 ## 当前进度
 
@@ -70,6 +96,15 @@
       问题：`config.py:82-85` 直接 `open(...,'w')` 写入，写中断即产生半截 JSON；
       `config.py:71-79` 遇 `JSONDecodeError` 静默回退默认配置并**覆盖写回**，
       此时 `initialized` 变回 `False`，下次启动 `init_folders` 会**再次把整个桌面搬一遍**。
+      ⚠️ **前置要求（AW-0 的对抗性复查发现的盲区，必须照做）**：AW-0 建的 36 个用例
+      **没有覆盖 `save_config` / `load_config` / `init_folders` / `_move_matching_files` /
+      `get_files_in_category`**——而这一项要改的**正是前两个**。所以：
+      **先补 `save_config` / `load_config` 的用例（含「半截 JSON」「非法 JSON」
+      「`initialized` 状态保留」这三条），确认它们当前是绿的（即在描述旧行为），
+      再动手改代码。** 不这么做的话，「用例只增不减」这条规则在本次改动上是空的，
+      等于没有回归网。改完后再把描述旧行为的用例改写成断言新行为，
+      并补一条「配置损坏不会触发二次搬移」的端到端用例（用 `init_folders` +
+      打桩 `CONFIG_PATH` 和 `storage_path`，全程在临时目录里）。
       修法：写入改为「写临时文件 → `os.replace` 原子替换」；解析失败时
       **先把损坏文件备份成 `config.json.corrupt-<时间戳>`**，再回退默认值，
       并且**保留原来的 `initialized` 状态**（从备份里尽量捞），不要让损坏触发二次搬移。
