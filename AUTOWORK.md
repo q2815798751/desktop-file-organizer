@@ -49,7 +49,7 @@
 
 ## 当前进度
 
-- [ ] **AW-0 建测试基建（可验证性）** —— 这是后面所有条目的前提，必须第一个做。
+- [x] **AW-0 建测试基建（可验证性）** —— 这是后面所有条目的前提，必须第一个做。
       建 `tests/` 目录，用标准库 `unittest`（零新依赖），入口
       `python -m unittest discover -s tests -v`。
       首批覆盖 `file_manager.py` 的纯逻辑：`get_desktop_path` / `get_storage_root` /
@@ -60,6 +60,11 @@
       完成标准：`python -m unittest discover -s tests -v` 全绿，用例数 ≥ 25，
       且**故意改坏一处逻辑能让对应用例变红**（验证测试真的有效，不是摆设）。
       验证后把实际用例数记到本条目末尾。
+      ✅ 已完成（2026-10-16）：实际 **36** 个用例，`python -m unittest discover -s tests -v`
+      全绿。反向验证：把 `_resolve_conflict` 的重命名模板从 `{name}({counter})` 改成
+      `{name} ({counter})`（多一个空格），重跑得 **6 failed**；`git diff` 确认回退干净后
+      重跑恢复全绿。全程在 `tempfile.TemporaryDirectory()` 内、config 指向临时路径，
+      未触碰真实桌面，仓库根目录未生成 `config.json`。
 
 - [ ] **AW-1 修 `save_config` 非原子写 + `load_config` 静默回退（数据安全，最高优先级）**
       问题：`config.py:82-85` 直接 `open(...,'w')` 写入，写中断即产生半截 JSON；
