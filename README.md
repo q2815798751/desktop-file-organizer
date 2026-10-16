@@ -31,6 +31,21 @@
 pip install -r requirements.txt
 ```
 
+## 运行测试
+
+测试用 Python 标准库 `unittest`（**零新依赖**，不需要 pytest），覆盖 `file_manager.py`
+的纯逻辑：桌面/存储路径解析、分类文件夹解析、文件名冲突消解、按扩展名归类、拖拽移入分类。
+
+在仓库根目录执行：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+全部用例都在 `tempfile.TemporaryDirectory()` 里造临时目录，并把配置里的
+`desktop_path` / `storage_path` 指向临时目录——**不会触碰真实桌面或真实用户文件**。
+测试不导入任何 GUI 模块（`dashboard.py` / `desktop_panel.py`），可在无 PyQt5 的环境下运行。
+
 ## 打包与分发
 
 用 PyInstaller 打包成**免安装的单个可执行文件**（单文件，双击即用）：
