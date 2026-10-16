@@ -92,7 +92,7 @@
       重跑恢复全绿。全程在 `tempfile.TemporaryDirectory()` 内、config 指向临时路径，
       未触碰真实桌面，仓库根目录未生成 `config.json`。
 
-- [ ] **AW-1 修 `save_config` 非原子写 + `load_config` 静默回退（数据安全，最高优先级）**
+- [x] **AW-1 修 `save_config` 非原子写 + `load_config` 静默回退（数据安全，最高优先级）**
       问题：`config.py:82-85` 直接 `open(...,'w')` 写入，写中断即产生半截 JSON；
       `config.py:71-79` 遇 `JSONDecodeError` 静默回退默认配置并**覆盖写回**，
       此时 `initialized` 变回 `False`，下次启动 `init_folders` 会**再次把整个桌面搬一遍**。
@@ -110,6 +110,17 @@
       并且**保留原来的 `initialized` 状态**（从备份里尽量捞），不要让损坏触发二次搬移。
       新增用例：模拟半截 JSON / 非法 JSON，断言 (a) 备份文件存在且内容等于原损坏内容，
       (b) 不会因配置损坏而重新执行首次搬移。
+      ✅ 已完成（2026-10-17）：实际 **52** 个用例（36 → 52，新增 `tests/test_config.py`
+      共 16 条），`python -m unittest discover -s tests -v` 全绿。
+      按要求先补 `save_config`/`load_config` 旧行为用例（半截 JSON / 非法 JSON /
+      initialized 状态，共 10 条）确认在旧代码上为绿，再动代码；改完后改写成断言新行为。
+      修法：`save_config` 走 `_atomic_write_json`（同目录临时文件 + `os.replace`）；
+      `load_config` 解析失败时 `shutil.copyfile` 备份为 `config.json.corrupt-<时间戳>`，
+      并用正则从原始文本抢救 `initialized`，捞不到才回退默认 `False`。
+      反向验证：`git checkout -- config.py` 撤掉修复、`git diff` 确认回退生效后重跑，
+      得 **5 failed**（原子写保护 1 + 损坏备份 2 + 保留 initialized 1 + 端到端二次搬移 1），
+      装回修复后恢复 52 全绿。全程 `mock.patch("config.CONFIG_PATH", 临时路径)` +
+      `tempfile.TemporaryDirectory()`，未在真实桌面验证，仓库根目录未生成 `config.json`。
 
 - [ ] **AW-2 修 `_resolve_conflict` 的 TOCTOU 与 `shutil.move` 静默失败（数据安全）**
       问题：`file_manager.py:170-183` 先查存在再返回目标名，与随后的
