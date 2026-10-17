@@ -550,7 +550,9 @@ class TestPartialMoveCleanup(InitFoldersTestBase):
         self.write_file(os.path.join(src, "in.txt"), "IN")
 
         def boom(_src, dst, *_a, **_k):
-            os.makedirs(dst)  # 模拟 copytree 已原子占用目标名
+            # dest 现在由 _move_dir_no_clobber 自己先原子占用（所有权证据），
+            # copytree 收到的是已存在的空目录 → 这里用 exist_ok 忠实模拟「拷到一半失败」
+            os.makedirs(dst, exist_ok=True)
             self.write_file(os.path.join(dst, "half.txt"), "HALF")
             raise OSError("disk full")
 
@@ -587,7 +589,7 @@ class TestPartialMoveCleanup(InitFoldersTestBase):
         self.write_file(os.path.join(src, "in.txt"), "IN")
 
         def boom(_src, dst, *_a, **_k):
-            os.makedirs(dst)
+            os.makedirs(dst, exist_ok=True)
             raise OSError("disk full")
 
         with mock.patch("file_manager.os.rename", side_effect=_exdev), \
@@ -601,6 +603,149 @@ class TestPartialMoveCleanup(InitFoldersTestBase):
             residual, os.path.join(self.folder, "proj"),
             "清理失败时必须把残留路径上报，而不是悄悄留下半成品",
         )
+
+
+# ── 失败清理的所有权校验（AW-17）────────────────────────
+#
+# 旧实现把「dest 已存在」与「copytree 起步失败」混为一谈：`_move_dir_no_clobber`
+# 的 `except BaseException` 分支**无条件 rmtree(dest)**。但 copytree 的第一步是
+# `os.scandir(src)`——若 src 在「rename 抛 EXDEV」与「copytree」之间被并发删除，
+# copytree 会在创建 dest **之前**就失败，此时 dest 可能是别人/用户并发创建的目录，
+# 无条件清理就会**删掉非自己创建的目录**（AW-17 复查实测：用户数据被删）。
+# 修复后：只有 `os.makedirs(dest)` 成功（=拿到所有权证据）之后的失败才清理。
+
+class TestCleanupOwnership(InitFoldersTestBase):
+
+    def setUp(self):
+        super().setUp()
+        self.folder = os.path.join(self.tmp, "target")
+        os.makedirs(self.folder)
+
+    def test_compound_race_does_not_delete_foreign_dest(self):
+        """
+        复现 AW-16 复查实测的复合竞态（用**真实** copytree）：
+          (1) os.rename 抛 EXDEV（Windows 语义下意味着当时 dest 不存在）；
+          (2) dest 在 rename 与 copytree 之间被并发创建（这里是用户的目录）；
+          (3) src 在该窗口被并发删除 → 真实 copytree 会在 `os.makedirs(dst)`
+              **之前**的 `os.scandir(src)` 就失败。
+        旧实现此时会无条件 rmtree(dest)，把用户目录连内容一起删掉。
+        修复后必须：用户目录一字节没少 + 失败被如实上报。
+        """
+        src = os.path.join(self.tmp, "victim")
+        self.write_file(os.path.join(src, "payload.txt"), "SRC")
+        dest = os.path.join(self.folder, "victim")
+        user_file = os.path.join(dest, "USERDATA.txt")
+
+        def racy_rename(src_arg, _dest_arg):
+            # 模拟「rename 抛 EXDEV 之后、copytree 之前」的并发窗口：
+            # dest 被并发创建成用户的目录，src 被并发删除，然后才抛 EXDEV。
+            os.makedirs(dest, exist_ok=True)
+            if not os.path.exists(user_file):
+                with open(user_file, "w", encoding="utf-8") as f:
+                    f.write("PRECIOUS")
+            if os.path.exists(src_arg):
+                shutil.rmtree(src_arg)
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+        with mock.patch("file_manager.os.rename", side_effect=racy_rename):
+            result = file_manager._move_no_clobber(src, self.folder, "victim")
+
+        # 1) 用户目录必须原封不动（旧实现会 rmtree 掉它）
+        self.assertTrue(os.path.isdir(dest), "用户目录被误删了！")
+        self.assertTrue(os.path.isfile(user_file), "用户数据文件被删了！")
+        self.assertEqual(self.read_file(user_file), "PRECIOUS", "用户数据被删/篡改")
+        # 2) 失败必须被如实上报，而不是假装成功
+        self.assertFalse(result.ok, "复合竞态下应返回失败结果")
+        self.assertIsInstance(result.error, OSError)
+
+    def test_foreign_dest_not_deleted_when_copytree_fails_before_makedirs(self):
+        """
+        更直接的所有权对照：把解析逼到**已预存的用户目录**上，copytree 又在
+        `os.makedirs(dst)` 之前的 `os.scandir(src)` 就失败（真实 copytree 的起步
+        失败形态）。修复后只允许清理我们自己建的目录 → 这个预存目录必须原样保留
+        （旧实现会无条件 rmtree 掉它）。
+        """
+        dest = os.path.join(self.folder, "victim")
+        self.write_file(os.path.join(dest, "USERDATA.txt"), "PRECIOUS")
+        src = os.path.join(self.tmp, "victim")
+        self.write_file(os.path.join(src, "in.txt"), "IN")
+
+        def fail_before_makedirs(_src, _dst, *_a, **_k):
+            # 忠实模拟真实 copytree 的「第一步 os.scandir(src) 就失败」：
+            # 此时 dest 还没被创建（这里的 dest 是别人预存的）
+            raise FileNotFoundError(errno.ENOENT, "src gone")
+
+        real = file_manager._resolve_conflict
+        state = {"fired": False}
+
+        def racy(folder, filename):
+            if not state["fired"]:
+                state["fired"] = True
+                # 硬指向已预存的 victim，让 dest 就是那个「别人的目录」
+                return os.path.join(folder, filename)
+            return real(folder, filename)
+
+        with mock.patch("file_manager.os.rename", side_effect=_exdev), \
+             mock.patch(
+                 "file_manager.shutil.copytree", side_effect=fail_before_makedirs
+             ), \
+             mock.patch("file_manager._resolve_conflict", side_effect=racy):
+            result = file_manager._move_no_clobber(src, self.folder, "victim")
+
+        self.assertTrue(os.path.isdir(dest), "预存的用户目录不得被删")
+        self.assertEqual(self.read_file(os.path.join(dest, "USERDATA.txt")), "PRECIOUS")
+        self.assertFalse(result.ok)
+
+
+# ── 拖拽/归类路径上报失败原因（AW-17 顺手修的既有缺陷）───
+#
+# 旧实现里 categorize_file / move_into_category 只看 result.ok，失败就
+# `return None, None`，于是 `MoveResult.error`（尤其 `PartialMoveError.residual`
+# 半成品路径）被静默吞掉——「有个半成品要手工清」这件事用户永远看不到。
+
+class TestDragPathReportsFailure(InitFoldersTestBase):
+
+    def test_categorize_file_logs_move_failure(self):
+        cfg = self.make_config(initialized=True)
+        src = self.write_file(os.path.join(self.desktop, "a.doc"), "NEW")
+        residual = os.path.join(self.storage, "办公文件", "a.doc")
+
+        # 让「占位已建、move 失败、清理也失败」真的发生 → PartialMoveError 带 residual
+        with mock.patch("file_manager.shutil.move", side_effect=OSError("boom")), \
+             mock.patch(
+                 "file_manager._cleanup_partial",
+                 side_effect=lambda dest, is_dir: dest,
+             ):
+            with self.assertLogs("file_manager", level="WARNING") as cm:
+                result = file_manager.categorize_file(src, cfg)
+
+        self.assertEqual(result, (None, None), "公开契约仍是 2 元组 (None, None)")
+        self.assertTrue(os.path.exists(src), "失败时源文件必须保留")
+        joined = "\n".join(cm.output)
+        self.assertIn("boom", joined, "失败原因必须被记录")
+        self.assertIn(residual, joined, "半成品残留路径必须被上报，不能静默吞掉")
+
+    def test_move_into_category_logs_residual(self):
+        cfg = self.make_config(initialized=True)
+        cat = {"name": "图片", "extensions": [], "folder": "图片"}
+        src_dir = os.path.join(self.desktop, "proj")
+        self.write_file(os.path.join(src_dir, "in.txt"), "IN")
+        residual = os.path.join(self.storage, "图片", "proj")
+
+        def boom(_src, dst, *_a, **_k):
+            os.makedirs(dst, exist_ok=True)
+            raise OSError("disk full")
+
+        with mock.patch("file_manager.os.rename", side_effect=_exdev), \
+             mock.patch("file_manager.shutil.copytree", side_effect=boom), \
+             mock.patch("file_manager.shutil.rmtree", lambda *_a, **_k: None):
+            with self.assertLogs("file_manager", level="WARNING") as cm:
+                result = file_manager.move_into_category(cfg, cat, src_dir)
+
+        self.assertEqual(result, (None, None))
+        joined = "\n".join(cm.output)
+        self.assertIn("disk full", joined, "失败原因必须被记录")
+        self.assertIn(residual, joined, "残留路径必须上报到拖拽路径的日志里")
 
 
 if __name__ == "__main__":

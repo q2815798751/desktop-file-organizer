@@ -3,12 +3,15 @@
 
 ⚠️ 平台前提（no-clobber 保证的基础）：
 本模块「绝不覆盖已存在的同名目标」这套保证，隐含依赖 **Windows 的 `os.rename`
-语义**——对已存在的文件或目录**一律**抛 `FileExistsError`，从不替换；
-而 POSIX 的 `os.rename` **会静默替换**已存在的目标。
+语义**——对已存在的文件或目录**一律**抛 `FileExistsError`，从不替换。
+而 POSIX 的 `os.rename` 语义不同：它会**静默替换**已存在的**文件**和**空目录**；
+只有目标是非空目录时才抛 `ENOTEMPTY`（此时不替换，与 Windows 一样安全）。
+也就是说 POSIX 下「文件和空目录」这两类目标会被静默覆盖/替换，会丢数据。
 本项目是 Windows 专用（大量 `ctypes.windll` 调用），故当前是安全的；
 但**移植到 POSIX 之前必须先改**这里（见 `_move_dir_no_clobber`），否则会踩。
 """
 import errno
+import logging
 import os
 import shutil
 import ctypes
@@ -28,6 +31,28 @@ MoveStats = namedtuple("MoveStats", ["moved", "failed", "errors"])
 # 竞态下换名重试上限：_resolve_conflict 已保证正常情况不冲突，
 # 这里只兜底「解析出目标名之后、原子占用之前被别的进程抢占」的极窄窗口。
 _CONFLICT_RETRIES = 100
+
+# 本模块的日志器。搬移失败（尤其是留下半成品残留）必须让用户/开发者看得见，
+# 不能再像旧实现那样 `return None, None` 把 `.residual` 静默吞掉。
+logger = logging.getLogger(__name__)
+
+
+def _log_move_failure(action, src, error):
+    """
+    把一次失败的搬移记录到日志（含半成品残留路径）。
+
+    `_move_no_clobber` 失败时会返回结构化结果，其中 error 若为 `PartialMoveError`
+    还带着 `.residual`（没清干净的半成品路径）。调用方只看 `result.ok` 的话，
+    「有个半成品要手工清」这件事就消失了——本函数专门负责把它喊出来。
+    """
+    residual = getattr(error, "residual", None)
+    if residual is not None:
+        logger.warning(
+            "%s失败，源保留原处：%s（原因：%s）；半成品残留需手工清理：%s",
+            action, src, error, residual,
+        )
+    else:
+        logger.warning("%s失败，源保留原处：%s（原因：%s）", action, src, error)
 
 
 def get_desktop_path(config):
@@ -113,6 +138,9 @@ def categorize_file(file_path, config):
             result = _move_no_clobber(file_path, folder, os.path.basename(file_path))
             if result.ok:
                 return cat["name"], result.path
+            # 失败不再静默吞掉：至少写进日志，别让 `.residual`（半成品路径）消失。
+            # 公开 API 仍是 2 元组 (None, None)，file_watcher 的解包契约不变。
+            _log_move_failure("归类", file_path, result.error)
             return None, None
 
     return None, None
@@ -207,6 +235,8 @@ def move_into_category(config, category, src_path):
     result = _move_no_clobber(src_path, folder, os.path.basename(src_path))
     if result.ok:
         return os.path.basename(result.path), result.path
+    # 拖拽路径同样不能再吞掉失败原因（含 `.residual` 半成品路径）。
+    _log_move_failure("拖拽收纳", src_path, result.error)
     return None, None
 
 
@@ -295,13 +325,21 @@ def _move_dir_no_clobber(src, dest):
     目录：`os.rename` 原子且不覆盖。
 
     ⚠️ **平台前提**：`os.rename` 的「目标已存在则抛 FileExistsError、绝不替换」
-    是 **Windows 语义**；POSIX 的 `os.rename` 会**静默替换**已存在的目标目录，
-    那样就会丢数据——移植到 POSIX 前必须改用其它原子占位手段。
+    是 **Windows 语义**；POSIX 的 `os.rename` 会**静默替换**已存在的**空目录**
+    （目标是非空目录时才抛 `ENOTEMPTY`、不替换），那样就会丢数据——
+    移植到 POSIX 前必须改用其它原子占位手段。
 
-    跨盘符（EXDEV）时退回 `copytree`：它内部第一步就是
-    `os.makedirs(dst, exist_ok=False)`，**原子占用**目标名，目标已存在同样抛
-    `FileExistsError`，因此不会覆盖或嵌套。
-    `copytree` 中途失败会留下半拷贝目录 → 清掉（源目录完好，只清我们建的那个）。
+    跨盘符（EXDEV）时退回 `copytree`。**关键：目标名由我们自己先原子占用**
+    （`os.makedirs(dest)`，`exist_ok=False`），成功即拿到「dest 是本轮创建的」
+    这条**所有权证据**；随后让 `copytree(..., dirs_exist_ok=True)` 往里拷。
+    这样任何失败清理都只可能删到**我们自己刚建的**目录。
+
+    ⚠️ 为什么不能无条件清理：旧实现把「dest 已存在」与「copytree 起步失败」
+    混为一谈，失败时无条件 `rmtree(dest)`。但 `copytree` 的第一步是
+    `os.scandir(src)`——若 `src` 在「rename 抛 EXDEV」与「copytree」之间被并发
+    删除，copytree 会在创建 dest **之前**就失败，而此时 dest 可能已被别的进程/
+    用户并发创建，无条件清理就会**删掉别人的目录**（AW-17 复查实测：用户数据被删）。
+    现在只有 `os.makedirs(dest)` 成功（=dest 确是我们建的）之后的失败才清理。
     """
     try:
         os.rename(src, dest)
@@ -311,14 +349,14 @@ def _move_dir_no_clobber(src, dest):
     except OSError as e:
         if getattr(e, "errno", None) != errno.EXDEV:
             raise
-    # 跨盘符：copytree 原子占用目标名（目标已存在 → FileExistsError → 上层换名重试）
+    # 跨盘符：先由我们自己原子占用目标名。这一步成功 = 拿到 dest 的所有权证据。
+    # 目标已存在 → FileExistsError（不是我们的，交给上层换名重试，**绝不清理**）；
+    # 其它 OSError（如父目录不可写）同样直接上抛，此时 dest 没建出来，更不能清理。
+    os.makedirs(dest)
     try:
-        shutil.copytree(src, dest)
-    except FileExistsError:
-        # 目标被别的进程占用（copytree 的 makedirs 抛的）→ 不是我们的，交给上层换名重试
-        raise
+        shutil.copytree(src, dest, dirs_exist_ok=True)
     except BaseException as e:
-        # 半拷贝残留：删掉这个不完整的 dest（src 完好无损）
+        # 走到这里说明 dest 确实是我们刚建的 → 清掉半拷贝残留是安全的（源目录完好）。
         leftover = _cleanup_partial(dest, is_dir=True)
         if leftover is not None:
             raise PartialMoveError(e, leftover) from e
