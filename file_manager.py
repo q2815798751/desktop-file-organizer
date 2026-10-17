@@ -886,6 +886,25 @@ def interpret_delete_result(result, aborted):
 
 # ── 桌面图标排列 ─────────────────────────────────────────
 
+def should_arrange_icons(config):
+    """
+    **纯函数**：根据配置决定启动时是否自动重排桌面图标（AW-13）。
+
+    旧行为（AW-13 之前）是**每次启动无条件**发 `LVM_ARRANGE/LVA_SNAPTOGRID`
+    重排用户的桌面图标，用户无法关闭。现在加一个配置项 `arrange_icons` 允许关闭，
+    但**默认值保持 True**——不改变现有用户的行为（默认值属产品决策，见 AUTOWORK
+    「待确认」区；改成默认 False 会让所有老用户突然不再排列）。
+
+    向后兼容：老配置里**没有这个键** → 返回 True（仍然排列），与旧行为一致。
+    配置层 `config.load_config` 也会在补全缺失字段时把它填成 True
+    （见 `config.DEFAULT_CONFIG`），所以无论从哪一层看，缺省都是「排列」。
+    只有**显式**把 `arrange_icons` 设成假值（JSON `false`）才关闭。
+
+    抽成纯函数是为了可单测（GUI 入口 `main.py` 不 import，只做 py_compile）。
+    """
+    return bool(config.get("arrange_icons", True))
+
+
 def _arrange_desktop_icons_impl():
     """
     实际执行桌面图标排列（对齐网格）：找到桌面的 `SysListView32` 并发 `LVM_ARRANGE`。

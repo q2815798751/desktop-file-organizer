@@ -20,7 +20,9 @@ from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QPen
 from PyQt5.QtCore import Qt, QTimer
 
 from config import load_config, get_auto_start, set_auto_start
-from file_manager import init_folders, get_desktop_path, arrange_desktop_icons
+from file_manager import (
+    init_folders, get_desktop_path, arrange_desktop_icons, should_arrange_icons,
+)
 from file_watcher import DesktopWatcher
 from panel_manager import PanelManager
 from dashboard import Dashboard
@@ -108,8 +110,10 @@ class MainApp:
                 "请在 config.json 里检查这些分类的 folder 字段后重启。",
             )
 
-        # 自动排列桌面图标
-        arrange_desktop_icons()
+        # 自动排列桌面图标（AW-13：可用配置项 arrange_icons 关闭；
+        # 缺省 / true 仍排列，保持现有行为）
+        if should_arrange_icons(self.config):
+            arrange_desktop_icons()
 
         # 面板管理器
         self.panel_manager = PanelManager(self.config)

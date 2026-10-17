@@ -1099,6 +1099,65 @@ class TestArrangeDesktopIcons(unittest.TestCase):
         self.assertFalse(ok)
 
 
+# ── 桌面图标重排的配置开关（AW-13） ──────────────────────────
+#
+# 旧行为：每次启动**无条件**重排桌面图标，用户无法关闭。新增配置项 `arrange_icons`，
+# **默认 True（缺省仍排列，向后兼容）**，显式设成 `false` 才关闭。
+#
+# ⚠️ 判定逻辑抽成纯函数 `file_manager.should_arrange_icons(config)`（file_manager
+# 无 PyQt5 依赖、可直接 import）。`main.py` 是 GUI 入口，**不 import**、只做
+# py_compile——所以「false 时真的不调用排列」用**复刻 main.py 门控**的方式断言
+# （与 AW-18 的 TestCallersCountMovesCorrectly 同法）：打桩窄接口
+# `_arrange_desktop_icons_impl`，断言 `false` 时它**根本没被调用**。
+# 打桩后绝不触碰真实 `ctypes.windll`（不会真的重排真实桌面图标）。
+
+class TestArrangeIconsConfigSwitch(unittest.TestCase):
+
+    @staticmethod
+    def _startup_arrange(config):
+        """复刻 main.py 启动时的门控写法（if should_arrange_icons(...): ...）。"""
+        if file_manager.should_arrange_icons(config):
+            file_manager.arrange_desktop_icons()
+
+    def test_missing_key_still_arranges_backward_compatible(self):
+        # 核心向后兼容点：老配置没有这个键 → 必须仍然排列（保持旧行为）
+        self.assertTrue(
+            file_manager.should_arrange_icons({}),
+            "配置缺省 arrange_icons 时必须仍然排列（向后兼容）",
+        )
+
+    def test_old_config_without_key_still_arranges(self):
+        old = {"categories": [], "initialized": True, "theme": "emerald"}
+        self.assertTrue(file_manager.should_arrange_icons(old))
+
+    def test_explicit_false_disables_arrange(self):
+        self.assertFalse(file_manager.should_arrange_icons({"arrange_icons": False}))
+
+    def test_explicit_true_arranges(self):
+        self.assertTrue(file_manager.should_arrange_icons({"arrange_icons": True}))
+
+    def test_disabled_does_not_call_arrange(self):
+        # false → 断言排列逻辑**根本没被调用**（打桩窄接口）
+        with mock.patch("file_manager._arrange_desktop_icons_impl") as impl:
+            self._startup_arrange({"arrange_icons": False})
+        impl.assert_not_called()
+
+    def test_missing_key_calls_arrange(self):
+        # 缺省 → 断言排列逻辑确实被调用一次（向后兼容）
+        with mock.patch(
+            "file_manager._arrange_desktop_icons_impl", return_value=True
+        ) as impl:
+            self._startup_arrange({})
+        impl.assert_called_once()
+
+    def test_enabled_calls_arrange(self):
+        with mock.patch(
+            "file_manager._arrange_desktop_icons_impl", return_value=True
+        ) as impl:
+            self._startup_arrange({"arrange_icons": True})
+        impl.assert_called_once()
+
+
 class TestSafeSize(unittest.TestCase):
     """
     AW-9：渲染文件列表/搜索结果时对每个条目取大小，绝不能因单个文件在

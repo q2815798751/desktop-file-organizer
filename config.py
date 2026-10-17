@@ -47,6 +47,10 @@ DEFAULT_CONFIG = {
     "storage_path": "",
     "auto_start": False,
     "initialized": False,
+    # 启动时是否自动重排桌面图标（对齐网格）。**默认 True 以保持现有行为**：
+    # 老配置里没有这个键 → load_config 补默认值时填 True → 仍然排列（向后兼容）。
+    # 显式设成 false 才关闭（AW-13：给用户一个关掉无条件重排的开关）。
+    "arrange_icons": True,
     "theme": "emerald",
     "panel_opacity": 1.0,
     "font_scale": 1.0,

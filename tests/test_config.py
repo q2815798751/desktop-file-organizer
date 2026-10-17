@@ -119,6 +119,38 @@ class TestSaveLoadRoundtrip(ConfigTestBase):
         self.assertEqual(self.corrupt_backups(), [], "正常配置不应产生损坏备份")
 
 
+# ── AW-13：桌面图标重排开关 arrange_icons 的默认值 / 向后兼容 ──
+
+class TestArrangeIconsDefault(ConfigTestBase):
+    """
+    AW-13 的配置层保证：`arrange_icons` 默认 True。
+
+    老配置（没有这个键）经 `load_config` 补全缺失字段后必须拿到 True ——
+    这是「向后兼容、不改变现有行为」在配置层的落点；显式设成 false 则必须保留。
+    """
+
+    def test_default_config_has_arrange_icons_true(self):
+        self.assertIs(
+            config.DEFAULT_CONFIG["arrange_icons"], True,
+            "默认值必须为 True（保持现有行为，产品决策）",
+        )
+
+    def test_old_config_without_key_is_backfilled_true(self):
+        # 一份「旧」配置：没有 arrange_icons
+        self.write_raw(json.dumps({"initialized": True, "theme": "emerald"}))
+        cfg = config.load_config()
+        self.assertIs(
+            cfg["arrange_icons"], True,
+            "老配置缺 arrange_icons 时必须补成 True（仍然排列）",
+        )
+
+    def test_explicit_false_is_preserved(self):
+        # 用户显式关掉 → load_config 不得把它改回 True
+        self.write_raw(json.dumps({"arrange_icons": False}))
+        cfg = config.load_config()
+        self.assertIs(cfg["arrange_icons"], False)
+
+
 # ── save_config 原子写 ───────────────────────────────────
 
 class TestAtomicSave(ConfigTestBase):
