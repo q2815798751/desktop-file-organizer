@@ -777,7 +777,7 @@
       未在真实桌面验证，仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在；
       `git status` 仅 3 个预期改动文件）。
 
-- [ ] **AW-8 把静默吞掉的异常改成可观测（健壮性）**
+- [x] **AW-8 把静默吞掉的异常改成可观测（健壮性）**
       问题：`file_manager.py:130`（批量移动失败 `pass`）、`file_manager.py:234`
       （桌面图标排列整体 `except Exception: pass`）、`file_manager.py:110-111`
       （列目录失败返回 `[]`）、`restore_files.py:27`（读配置失败静默用默认路径）——
@@ -786,6 +786,61 @@
       可以用标准库 `logging`，或把失败计数返回给调用方——**选一种并保持一致**，在条目里说明选择理由。
       ⚠️ 注意 AW-2 也在动 `file_manager.py` 的异常处理，**先读一遍当前代码再改，别覆盖掉 AW-2 的成果**。
       新增用例：模拟各失败路径 → 断言失败被记录/被返回，而不是无声无息。
+      ✅ 已完成（2026-10-17）：实际 **234** 个用例（225 → 234，净增 9 条：
+      `tests/test_file_manager.py` 新增 `TestArrangeDesktopIcons` 4 条 +
+      `tests/test_init_folders.py` 2 条 + `tests/test_restore_files.py`
+      新增 `TestUnreadableConfig` 3 条），`python -m unittest discover -s tests -v` 全绿。
+      **记录方式的选择：标准库 `logging`（WARNING）**。理由：
+      (1) 本仓库 AW-17/AW-21 已经立了这套风格（`file_manager.logger` + `_log_move_failure`、
+      `restore_files.logger`），用它最一致；
+      (2) 另外三处**返回类型装不下失败信息**——`arrange_desktop_icons()` 返回 bool（`main.py` 用）、
+      `get_files_in_category()` 返回列表（GUI 用）、`restore()` 无返回值，改成「返回失败计数」
+      就得动公开契约或塞哨兵值，而「记录」不需要；
+      (3) WARNING 默认打到 stderr，用户/开发者**真看得见**，且 `assertLogs` 让它可单测。
+      **四处各改成什么**（行号是改动前的旧行号）：
+      - **`file_manager.py:130` 批量移动失败 `pass`**：AW-2 已把它改成返回
+        `MoveStats(moved, failed, errors)`——**保持不变，没覆盖**。本轮只补两处：
+        (a) `_move_matching_files` 的**列目录失败**分支旧写法 `MoveStats(0, 0, [e])`
+        把「列不出目录」算成 **0 失败**（只看 `failed` 的调用方会漏掉），改为 `failed=1` 并记
+        WARNING；(b) 每条搬移失败额外调 `_log_move_failure("首次整理", …)`，与归类/拖拽路径一致。
+      - **`file_manager.py:234` 桌面图标排列 `except Exception: pass`**：把 ctypes 那段抽成
+        **可注入的窄接口** `_arrange_desktop_icons_impl()`（不吞异常、可被 mock），
+        `arrange_desktop_icons()` 改为 `try: return _arrange_desktop_icons_impl()` +
+        `except Exception as e: logger.warning(...); return False`。返回值仍是 bool，
+        `main.py` 行为不变。
+      - **`file_manager.py:110-111` 列目录失败返回 `[]`**（`get_files_in_category`）：
+        公开契约仍是 `[]`（GUI 刷新不能崩），但 `except OSError as e:` 里记一条 WARNING
+        （含是哪个目录读不出来）。
+      - **`restore_files.py:27` 读配置失败静默用默认路径**：AW-6 已删掉旧的 `_storage_root()`
+        （`except Exception: pass`），但 `restore()` 直接调 `config.load_config()`、失败就没
+        兜底。新增窄接口 `_load_config_or_default()`：`try: return config.load_config()`
+        + `except Exception as e: logger.warning(...); return {}`，`restore()` 改用它。
+        ⚠️ 行为变化（如实说明）：分类清单现在是**配置驱动**的，读失败 → 空分类清单 →
+        计划为空 → **一个文件都不搬**（fail-closed），比旧实现「读不到配置就硬编码 5 个
+        默认分类照搬」更安全。
+      反向验证（**四组定点破坏**，未用 `git checkout origin/master -- <文件>` 那种超集回退；
+      每组先 `git diff` 确认 `BREAK` 标记生效）：
+      (A) 把 `arrange_desktop_icons` 的 `except Exception as e: logger.warning(...)` 改回
+          `except Exception: pass` → 重跑得 **2 failed**（`test_failure_is_logged_and_returns_false`
+          / `test_exception_does_not_propagate`），断言输出是
+          `AssertionError: no logs of level WARNING or higher triggered on file_manager`；
+      (B) 把 `get_files_in_category` 的日志行改回裸 `return []` → 重跑得 **1 failed**
+          （`test_listdir_oserror_is_logged`）；
+      (C) 把 `_move_matching_files` 的列目录分支改回 `MoveStats(0, 0, [e])` **并**去掉
+          `_log_move_failure` 调用 → 重跑得 **2 failed**
+          （`test_listdir_failure_counted_as_failure_and_logged` / `test_move_failure_is_reported`）；
+      (D) 把 `_load_config_or_default` 的 `except Exception as e: logger.warning(...)` 改回
+          `except Exception: pass` → 重跑得 **2 failed**（`test_read_failure_logs_and_returns_empty_config`
+          / `test_restore_with_unreadable_config_moves_nothing`）。
+      装回后 `grep BREAK` 0 命中、恢复 234 全绿。
+      全程 `tempfile.TemporaryDirectory()` + `mock.patch("config.CONFIG_PATH", 临时路径)`；
+      新增用例**不调用**真实 `ctypes.windll`（`arrange_desktop_icons` 只 mock 窄接口）、
+      `restore()` 的搬移调用用**记录型 spy** 掉包 `shutil.move`（只记录、不真搬）；
+      未 import GUI/`file_watcher`（`dashboard.py`/`desktop_panel.py`/`panel_manager.py`/
+      `main.py`/`file_watcher.py` 只做 `py_compile` 静态检查，均通过）；
+      未运行 `main.py` / `restore_files.py` 的 `__main__` 入口，未在真实桌面验证，
+      仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在；
+      `git status` 仅 5 个预期改动文件）。
 
 - [ ] **AW-9 修搜索时 `getsize` 崩溃（正确性）**
       问题：`dashboard.py:1377` 对搜索结果条目调 `os.path.getsize`，
