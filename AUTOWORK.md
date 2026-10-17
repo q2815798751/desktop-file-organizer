@@ -1152,7 +1152,7 @@
         未运行 `main.py` / `restore_files.py`，未在真实桌面验证，
         仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在）。
 
-- [ ] **AW-20 补 AW-4 复查点名的覆盖缺口 + 更正被夸大的危害表述（测试基建 + 文档诚实性）**
+- [x] **AW-20 补 AW-4 复查点名的覆盖缺口 + 更正被夸大的危害表述（测试基建 + 文档诚实性）**
 
       AW-4 的对抗性复查确认「大小写/分隔符**不能**绕过」（它追到 CPython 源码：
       `os.path.commonpath` 内部**先把路径 `lower()` 再逐组件比较**，返回值却用 `paths[0]`
@@ -1185,6 +1185,56 @@
 
       > 教训：**早期勘察报告里的「危害程度」和修复断言一样需要被对抗性检验。**
       > 这次复查实测推翻了勘察写的严重性——而我在写 AW-4 条目时把那个说法原样抄了下来。
+      ✅ 已完成（2026-10-17）：实际 **284** 个用例（280 → 284，净增 4 条，全在
+      `tests/test_file_manager.py::TestMoveIntoCategoryRejectsStorageAncestors`），
+      `python -m unittest discover -s tests -v` 全绿（**无 skip**，4 条新用例本机实跑；
+      `python -W error::SyntaxWarning -m py_compile` 亦干净）。
+      - **(1) 大小写 / 参数顺序锁定**：`storage_ancestor_error` 的 docstring 新增一段，
+        写明「大小写不敏感**不是显式意图**，而是依赖 `os.path.commonpath` 内部先
+        `lower()` 比较、却用 `paths[0]` 的原始大小写拼回返回值」这一实现细节，并点明
+        **参数顺序是硬前提（必须 `commonpath([src, root])`，src 在前）**——反序会让
+        `common == src` 在大小写不同的输入上失配 → 漏判。新增 3 条用例：
+        `test_case_variant_src_uppercase_is_rejected`（root `C:\storage` / src `C:\STORAGE`
+        → 断言仍拒绝）、`test_case_variant_root_uppercase_is_rejected`（反方向）、
+        `test_commonpath_argument_order_is_load_bearing`（直接断言
+        `commonpath([src,root]) == src` 且 `commonpath([root,src]) != src`，把顺序前提钉死）。
+      - **(2) `\\?\` 前缀已知行为**：选「**如实标注为放行**」（不改代码拒绝）。
+        理由：这是**不可达的纸面缺口**——`\\?\` 前缀经 `abspath` 保留、`commonpath` 认
+        盘符 `\\?\C:` ≠ `C:` → `ValueError` → guard 放行；但分类目录必在被拖入源之内，
+        随后真实 `os.rename` 以 `WinError 5` 失败，最终仍返回 `(None, None)`，存储根不动；
+        且拖拽源来自 Qt 的 `QUrl.toLocalFile()`，资源管理器不产生 `\\?\`。改代码去归一化
+        前缀属另一条更宽的改动、超出本项范围，故如实标注 + 钉住。新增用例
+        `test_extended_prefix_is_known_passthrough_but_not_exploitable`：先断言
+        `abspath(ext_src) == ext_src`（前缀保留）与 guard **返回 None（确被绕过）**；
+        再用 `mock.patch(..., wraps=file_manager._move_no_clobber)` 的 spy 断言
+        **`_move_no_clobber` 确实被调用**、但结果仍是 `(None, None)`、存储根下只多出分类
+        目录（一字节没被搬走）。docstring 里同步如实标注这条已知缺口。
+      - **(3) 更正被夸大的危害表述**：`file_manager.py` 的 `storage_ancestor_error`
+        docstring 与 `move_into_category` 内联注释、`tests/...` 的类 docstring 三处旧说法
+        「把存储根父目录拖进来会把整个存储目录连同分类搬走 → 存储根位移、配置全部失效」
+        改为**如实描述**：定位是**纵深防御 + UX 改善**，**不是**可达缺陷——实测关掉校验后
+        四级祖先全因「目标目录必在源之内、`os.rename` 以 `WinError 5` 失败」返回
+        `(None, None)`，存储根纹丝不动；本校验的价值是**干净的静默拒绝**。README 原本
+        **没有**这处夸大说法（已全文核对），故在「安全行为」后**新增**一小段如实记录
+        拖入存储根/祖先会被静默拒绝及其真实定位（纵深防御，非可达缺陷）。
+      反向验证（**两步定点破坏**，未用 `git checkout origin/master -- <文件>` 那种超集回退；
+      每步先 `git diff` / `grep BREAK` 确认破坏生效）：
+      (A) 把 `storage_ancestor_error` 的 `commonpath([src, root])` 反序为
+          `commonpath([root, src])`（`# BREAK-AW20-A`）→ 重跑得 **2 failed**，正是两条
+          大小写变体用例（`test_case_variant_src_uppercase_is_rejected` /
+          `test_case_variant_root_uppercase_is_rejected`），证明「src 在前」这条顺序前提
+          被用例真正锁定；
+      (B) 加一段「把 `\\?\` 前缀剥掉再比较」的代码（模拟「拒绝 `\\?\`」的替代修法，
+          `# BREAK-AW20-B`）→ 重跑得 **1 failed**，正是
+          `test_extended_prefix_is_known_passthrough_but_not_exploitable`（该用例钉的是
+          当前「放行」行为，改成拒绝就会变红），证明这条已知行为被用例真正钉住。
+      装回后 `grep BREAK` 0 命中、恢复 284 全绿。
+      全程 `tempfile.TemporaryDirectory()` 造目录、config 字典指向临时路径；`\\?\` 用例里
+      真实 `os.rename` 只在临时目录内尝试并如期失败（WinError 5）；未 import GUI 模块
+      （`dashboard.py`/`desktop_panel.py`/`panel_manager.py`/`main.py`/`file_watcher.py`
+      仅 `py_compile`，均通过）；未运行 `main.py` / `restore_files.py`，未在真实桌面验证，
+      仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在；
+      `git status` 仅 3 个预期改动文件）。
 
 ## 待确认（不要擅自做，等用户拍板）
 
