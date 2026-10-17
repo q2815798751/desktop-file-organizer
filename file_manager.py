@@ -185,6 +185,38 @@ def realpath_escape_error(storage_root, target):
     return None
 
 
+def storage_ancestor_error(storage_root, src_path):
+    """
+    纯函数：判断 `src_path` 是否为存储根目录**本身或其任一祖先目录**。
+    返回 None 表示「不是」（可以移入分类）；否则返回一句中文错误说明。
+
+    ⚠️ 这是**源路径**的校验（拖进来的东西），与 `category_folder_error` /
+    `realpath_escape_error` 那两个**目标路径**校验不是一回事，别混用。
+
+    ⚠️ 为什么必须拒绝（AW-4）：`move_into_category` 的旧防护只拒绝「分类文件夹本身」
+    和「存储根这一层」。把存储根的**父目录**（如 `Documents`、`~`）拖进面板时，
+    `_move_no_clobber` 会把**整个存储目录连同所有分类**搬进某个分类里，
+    导致存储根位移、`config` 里记录的路径全部失效、用户的文件"消失"在错误位置。
+    所以必须拒绝存储根**及其所有祖先**。
+
+    ⚠️ 不能用 `startswith` 判前缀：`...\\sub\\stor` 是 `...\\sub\\storage` 的字符串前缀，
+    但它只是**兄弟目录**、并非祖先——`startswith` 会把它误判成祖先，从而拒绝一次
+    完全正常的收纳。这里用 `os.path.commonpath`：`src` 是存储根的祖先 ⟺
+    二者的公共路径**恰等于 src 本身**（`commonpath` 对不同盘符抛 `ValueError`，
+    那种情况 src 不可能是祖先，返回 None）。
+    """
+    try:
+        root = os.path.abspath(storage_root)
+        src = os.path.abspath(src_path)
+        common = os.path.commonpath([src, root])
+    except ValueError:
+        # 不同盘符 / 无法比较 → src 不可能是存储根的祖先
+        return None
+    if common == src:
+        return f"不能把存储目录「{root}」或其上级目录移入分类。"
+    return None
+
+
 def unsafe_category_message(category, error):
     """
     纯函数：为被跳过的非法分类生成一句**用户可见**的中文提示。
@@ -413,13 +445,19 @@ def move_into_category(config, category, src_path):
     except ValueError:
         pass  # 不同盘符，不在此判断
 
-    # 源是分类文件夹或存储根 → 拒绝（非法分类直接跳过，不参与比较）
+    # 源是分类文件夹 → 拒绝（非法分类直接跳过，不参与比较）
     cat_folders = set()
     for c in config.get("categories", []):
         f = safe_category_folder(config, c)
         if f is not None:
             cat_folders.add(os.path.abspath(f))
-    if src_abs in cat_folders or src_abs == os.path.abspath(get_storage_root(config)):
+    if src_abs in cat_folders:
+        return None, None
+
+    # 源是存储根**或其任一祖先目录** → 拒绝（AW-4）。
+    # 旧防护只挡「存储根这一层」，把存储根的父目录（如 Documents）拖进来会把
+    # 整个存储目录连同分类一起搬走 → 存储根位移、配置全部失效。
+    if storage_ancestor_error(get_storage_root(config), src_abs):
         return None, None
 
     os.makedirs(folder, exist_ok=True)

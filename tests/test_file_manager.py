@@ -617,6 +617,127 @@ class TestMoveIntoCategory(TempDirsMixin, unittest.TestCase):
         self.assertTrue(os.path.isdir(folder))
 
 
+# ── AW-4：move_into_category 必须拒绝存储根及其所有祖先 ──
+
+class TestMoveIntoCategoryRejectsStorageAncestors(TempDirsMixin, unittest.TestCase):
+    """
+    旧防护只拒绝「分类文件夹本身」和「存储根」这一层。把存储根的**父目录**
+    （如 `Documents`）拖进面板，会把整个存储目录连同所有分类搬进某个分类 →
+    存储根位移、配置全部失效。现在必须拒绝存储根**及其所有祖先**。
+
+    存储根特意放深几层（tmp/base/sub/storage），以便测「多层祖先」，
+    并确认 `startswith` 会误伤的前缀兄弟目录（`stor`）仍能正常收纳。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.nest = os.path.join(self.tmp, "base", "sub")
+        os.makedirs(self.nest)
+        self.storage = os.path.join(self.nest, "storage")
+        os.makedirs(self.storage)
+        self.cfg = self.make_config()
+        self.pics = CATEGORIES[2]  # 图片
+
+    def _assert_rejected(self, src):
+        # ⚠️ 必须用 spy 证明「拒绝发生在搬移之前」：祖先目录本身包含目标分类，
+        # 就算真的去搬也会因「移进自己的子目录」而失败——只看返回值 (None, None)
+        # 区分不出「被防护挡住」和「搬移碰巧失败」。断言根本没调用搬移才是判别性的。
+        with mock.patch("file_manager._move_no_clobber") as spy:
+            result = file_manager.move_into_category(self.cfg, self.pics, src)
+        self.assertEqual(result, (None, None))
+        self.assertFalse(spy.called, "祖先目录必须在搬移之前就被拒绝，绝不能真的尝试移动")
+        self.assertTrue(os.path.exists(src), "被拒绝的源必须原地不动")
+
+    # —— 存储根本身 + 各级祖先，全部拒绝 ——
+
+    def test_rejects_storage_root(self):
+        self._assert_rejected(self.storage)
+
+    def test_rejects_immediate_parent(self):
+        # 存储根的父目录（相当于真实场景里的 Documents）
+        self._assert_rejected(self.nest)
+
+    def test_rejects_grandparent(self):
+        self._assert_rejected(os.path.join(self.tmp, "base"))
+
+    def test_rejects_top_ancestor(self):
+        # 最高层祖先（相当于 ~ / 用户主目录）
+        self._assert_rejected(self.tmp)
+
+    def test_rejection_leaves_storage_and_categories_intact(self):
+        # 拒绝后存储根与其下的分类目录必须一个没少（且根本没尝试搬移）
+        cat_dir = os.path.join(self.storage, "图片")
+        os.makedirs(cat_dir)
+        self._assert_rejected(self.nest)
+        self.assertTrue(os.path.isdir(self.storage))
+        self.assertTrue(os.path.isdir(cat_dir))
+
+    # —— 正常条目仍可移入（别把校验写得太狠）——
+
+    def test_normal_desktop_file_still_moves(self):
+        src = self.write_file(os.path.join(self.desktop, "a.png"))
+        name, dest = file_manager.move_into_category(self.cfg, self.pics, src)
+        self.assertEqual(name, "a.png")
+        self.assertTrue(os.path.isfile(dest))
+        self.assertFalse(os.path.exists(src))
+        self.assertEqual(os.path.dirname(dest), os.path.join(self.storage, "图片"))
+        self.assertInsideTmp(dest)
+
+    def test_normal_desktop_directory_still_moves(self):
+        src_dir = os.path.join(self.desktop, "myfolder")
+        self.write_file(os.path.join(src_dir, "inside.txt"))
+        name, dest = file_manager.move_into_category(self.cfg, self.pics, src_dir)
+        self.assertEqual(name, "myfolder")
+        self.assertTrue(os.path.isfile(os.path.join(dest, "inside.txt")))
+        self.assertFalse(os.path.exists(src_dir))
+
+    def test_prefix_sibling_directory_is_not_rejected(self):
+        # `stor` 是存储根目录名 `storage` 的字符串前缀，但只是**兄弟目录**、并非祖先。
+        # 用 startswith 判前缀的实现会把它误判成祖先而拒绝——这里必须能正常收纳。
+        sibling = os.path.join(self.nest, "stor")
+        self.write_file(os.path.join(sibling, "keep.txt"))
+        name, dest = file_manager.move_into_category(self.cfg, self.pics, sibling)
+        self.assertEqual(name, "stor")
+        self.assertTrue(os.path.isfile(os.path.join(dest, "keep.txt")))
+        self.assertFalse(os.path.exists(sibling))
+
+    def test_deep_file_inside_storage_is_not_rejected_by_ancestor_rule(self):
+        # 存储根**内部**的文件是后代、不是祖先：由「已在目标分类内」规则处理，
+        # 别被本项误伤（放到另一个分类下仍可移动）。
+        inner = self.write_file(os.path.join(self.storage, "图片", "inner.png"))
+        # 目标就是它所在的分类 → 已在分类内，跳过（保持既有行为）
+        self.assertEqual(
+            file_manager.move_into_category(self.cfg, self.pics, inner), (None, None)
+        )
+        self.assertTrue(os.path.exists(inner))
+
+    # —— 纯函数本身 ——
+
+    def test_pure_function_rejects_ancestors(self):
+        for src in (self.storage, self.nest, os.path.join(self.tmp, "base"), self.tmp):
+            err = file_manager.storage_ancestor_error(self.storage, src)
+            self.assertIsNotNone(err, f"{src!r} 是存储根的祖先/本身，应被拒绝")
+            self.assertTrue(err.strip())
+
+    def test_pure_function_allows_non_ancestors(self):
+        for src in (
+            os.path.join(self.desktop, "a.png"),
+            os.path.join(self.nest, "stor"),          # 前缀兄弟目录
+            os.path.join(self.tmp, "elsewhere"),
+            os.path.join(self.storage, "图片", "x"),  # 存储根的后代
+        ):
+            self.assertIsNone(
+                file_manager.storage_ancestor_error(self.storage, src),
+                f"{src!r} 不是存储根的祖先，不该被拒绝",
+            )
+
+    def test_pure_function_allows_other_drive(self):
+        # 不同盘符 → commonpath 抛 ValueError → 不可能是祖先 → 放行
+        drive = os.path.splitdrive(self.storage)[0].upper()
+        other = "Z:\\x" if drive != "Z:" else "Y:\\x"
+        self.assertIsNone(file_manager.storage_ancestor_error(self.storage, other))
+
+
 # ── did_move：调用方判定（失败不能被当成功）──────────────
 #
 # AW-18：`move_into_category` / `categorize_file` 失败时返回 (None, None)，
