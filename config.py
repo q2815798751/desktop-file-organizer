@@ -3,7 +3,6 @@
 """
 import json
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -68,23 +67,6 @@ def _default_config():
     return cfg
 
 
-def _salvage_initialized(raw_text):
-    """
-    从损坏的原始文本里尽量捞出 initialized 状态。
-    返回 True/False，捞不到则返回 None。
-
-    为什么需要：配置损坏时若把 initialized 重置为 False，下次启动
-    init_folders 会认为「首次运行」而**再次搬移整个桌面**，造成数据风险。
-    这里用正则从半截 JSON 里抢救出原来的状态。
-    """
-    if not raw_text:
-        return None
-    m = re.search(r'"initialized"\s*:\s*(true|false)', raw_text)
-    if m:
-        return m.group(1) == "true"
-    return None
-
-
 def _backup_corrupt_config():
     """把损坏的配置文件备份成 config.json.corrupt-<时间戳>，返回备份路径或 None。"""
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -119,24 +101,31 @@ def load_config():
     """
     加载配置，不存在则创建默认配置。
 
-    解析失败时：先把损坏文件备份成 config.json.corrupt-<时间戳>，
-    再回退默认值，并尽量保留原来的 initialized 状态——避免配置损坏
-    触发 init_folders 的「二次搬移」。
+    **首次运行 vs 配置损坏** 是这里唯一重要的一对分支：
+
+    - 配置文件**不存在** → 真的是首次运行，返回默认配置（initialized=False），
+      之后 init_folders 会做一次首次搬移。
+    - 配置文件**存在但读不出来**（半截 JSON / 非法 JSON / 非 UTF-8 字节 / 读取报错）
+      → 先把损坏文件备份成 config.json.corrupt-<时间戳>，再回退默认值，但
+      **把 initialized 强制置为 True**。
+
+    为什么损坏时必须按「跑过」处理：initialized=False 的语义是「从没运行过」，
+    会让 init_folders 把**整个桌面再搬一次**（文件被改名成 name(1).ext）。
+    而「配置文件存在」这件事本身就证明程序至少跑过一次——首次运行时
+    load_config 会立刻把默认配置落盘。所以宁可少搬（用户可手动整理），
+    也不能二次搬移（会打乱用户文件）。
+
+    注意：这里**不再**从损坏文本里正则抢救 initialized。那种抢救用 re.search
+    取第一个匹配且不分层级，会被无关的嵌套键（{"nested": {"initialized": false}}）
+    骗到危险方向；而「文件存在即视为跑过」比它可靠得多，抢救已无必要。
     """
     if os.path.exists(CONFIG_PATH):
-        raw = None
+        cfg = None
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                raw = f.read()
-        except (OSError, UnicodeDecodeError):
-            raw = None
-
-        cfg = None
-        if raw is not None:
-            try:
-                cfg = json.loads(raw)
-            except ValueError:
-                cfg = None
+                cfg = json.loads(f.read())
+        except (OSError, UnicodeDecodeError, ValueError):
+            cfg = None
 
         if isinstance(cfg, dict):
             # 补全缺失的默认字段
@@ -147,13 +136,10 @@ def load_config():
                 cfg["desktop_path"] = _get_default_desktop()
             return cfg
 
-        # 配置损坏或读不出来：先备份（若拿到文件），再回退默认值，保留 initialized
-        if os.path.exists(CONFIG_PATH):
-            _backup_corrupt_config()
-        salvaged = _salvage_initialized(raw)
+        # 文件存在但读不出来 / 不是 JSON 对象 → 视为损坏
+        _backup_corrupt_config()
         cfg = _default_config()
-        if salvaged is not None:
-            cfg["initialized"] = salvaged
+        cfg["initialized"] = True
         save_config(cfg)
         return cfg
 

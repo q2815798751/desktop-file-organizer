@@ -147,7 +147,10 @@ class TestAtomicSave(ConfigTestBase):
         self.assertEqual(leftovers, [], "成功写入后不应残留临时文件")
 
 
-# ── 损坏配置：备份 + 保留 initialized ─────────────────────
+# ── 损坏配置：备份 + 保守地按「跑过」处理 ─────────────────
+#
+# AW-15：回退方向必须保守。**只有文件不存在才是首次运行**；
+# 文件存在但读不出来 = 程序跑过 → initialized=True，绝不触发二次搬移。
 
 class TestCorruptConfigRecovery(ConfigTestBase):
 
@@ -176,19 +179,91 @@ class TestCorruptConfigRecovery(ConfigTestBase):
         with open(backups[0], "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), corrupt)
 
-    def test_invalid_json_without_initialized_falls_back_to_false(self):
-        # 捞不到 initialized → 保持默认 False（真正的首次运行仍应初始化）
+    def test_invalid_json_without_initialized_is_treated_as_ran(self):
+        # 旧行为：捞不到 initialized → 回退 False（危险，会二次搬移）
+        # 新行为：文件存在即视为「跑过」→ True
         self.write_raw("totally broken {{{")
         cfg = config.load_config()
-        self.assertFalse(cfg["initialized"])
+        self.assertTrue(cfg["initialized"], "存在但读不出来的配置必须按「跑过」处理")
 
-    def test_corrupt_config_preserves_initialized_false(self):
+    def test_corrupt_config_with_initialized_false_is_still_treated_as_ran(self):
+        # 即使损坏文本里写着 false，也不能据此重跑首次搬移：
+        # 顶层 false 无法与「嵌套的无关 false」区分，且方向一旦搞错代价是搬两遍桌面。
         self.write_raw('{"initialized": false, "categories": [')
         cfg = config.load_config()
-        self.assertFalse(cfg["initialized"])
+        self.assertTrue(cfg["initialized"], "损坏配置一律按「跑过」处理")
+
+    def test_truncated_before_initialized_is_treated_as_ran(self):
+        # 旧的非原子写最可能产生的损坏形态：截断在 initialized 之前。
+        # 旧实现正则抢救返回 None → 回退 False → 二次搬移。
+        self.write_raw('{"categories": [{"name": "图片", "extensions": ["png"]}')
+        cfg = config.load_config()
+        self.assertTrue(cfg["initialized"], "截断在 initialized 之前也必须按「跑过」处理")
+
+    def test_nested_initialized_false_does_not_fool_recovery(self):
+        # 旧实现用 re.search 取第一个匹配且不分层级 → 被嵌套的 false 骗到危险方向。
+        self.write_raw(
+            '{"nested": {"initialized": false}, "initialized": true, "categories": ['
+        )
+        cfg = config.load_config()
+        self.assertTrue(cfg["initialized"], "不能被嵌套的 initialized=false 骗到")
+
+    def test_nested_initialized_true_does_not_fool_recovery(self):
+        self.write_raw(
+            '{"nested": {"initialized": true}, "initialized": false, "categories": ['
+        )
+        cfg = config.load_config()
+        self.assertTrue(cfg["initialized"], "存在但读不出来的一律按「跑过」处理")
+
+    def test_undecodable_config_is_backed_up_and_treated_as_ran(self):
+        blob = b"\xff\xfe\x00\x01\x02not-utf8"
+        with open(self.config_path, "wb") as f:
+            f.write(blob)
+
+        cfg = config.load_config()
+
+        self.assertTrue(cfg["initialized"], "无法解码的配置必须按「跑过」处理")
+        backups = self.corrupt_backups()
+        self.assertEqual(len(backups), 1, "无法解码的配置也必须备份")
+        with open(backups[0], "rb") as f:
+            self.assertEqual(f.read(), blob, "备份必须逐字节等于原损坏内容")
+
+    def test_read_oserror_is_treated_as_ran(self):
+        import builtins
+
+        config.save_config({"initialized": True, "categories": []})
+        real_open = builtins.open
+        cfg_path = os.path.abspath(self.config_path)
+
+        def flaky_open(path, mode="r", *args, **kwargs):
+            if os.path.abspath(path) == cfg_path and "r" in mode and "b" not in mode:
+                raise OSError("permission denied")
+            return real_open(path, mode, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=flaky_open):
+            cfg = config.load_config()
+
+        self.assertTrue(cfg["initialized"], "读取报错时必须按「跑过」处理")
+
+    def test_valid_json_that_is_not_an_object_is_treated_as_corrupt(self):
+        # 合法 JSON 但不是对象（如 [] / null）→ 与损坏等价处理
+        self.write_raw("[]")
+        cfg = config.load_config()
+        self.assertTrue(cfg["initialized"])
+        self.assertEqual(len(self.corrupt_backups()), 1)
+
+    def test_salvage_helper_is_gone(self):
+        # AW-15(b)：正则抢救会被嵌套键骗到，已删除——少一段会骗人的代码。
+        self.assertFalse(
+            hasattr(config, "_salvage_initialized"),
+            "_salvage_initialized 应已被删除（它会被嵌套键骗到危险方向）",
+        )
 
 
 # ── 端到端：损坏配置不得触发二次搬移 ──────────────────────
+#
+# 全程只在 tempfile.TemporaryDirectory() 内：假桌面 + 假存储根，
+# config.CONFIG_PATH 已打桩到临时路径（init_folders 会调 save_config）。
 
 class TestCorruptConfigDoesNotTriggerSecondMove(ConfigTestBase):
 
@@ -199,31 +274,86 @@ class TestCorruptConfigDoesNotTriggerSecondMove(ConfigTestBase):
         os.makedirs(self.desktop)
         os.makedirs(self.storage)
 
-    def test_corrupt_config_keeps_initialized_and_avoids_second_move(self):
-        # 一份「已初始化过」但被写坏的配置（模拟写中断留下的半截 JSON）
-        self.write_raw('{\n  "initialized": true,\n  "categories": [')
-
-        cfg = config.load_config()
-        self.assertTrue(cfg["initialized"], "损坏配置必须保留 initialized，避免二次搬移")
-
+    def _prepare(self, cfg):
+        """把配置指向假桌面/假存储根，并放一个「本该被搬走」的文件。"""
         cfg["desktop_path"] = self.desktop
         cfg["storage_path"] = self.storage
         cfg["categories"] = [dict(c) for c in CATEGORIES]
-
-        # 桌面上放一个本该被搬走的文件
         src = os.path.join(self.desktop, "report.doc")
         with open(src, "w", encoding="utf-8") as f:
             f.write("keep me")
+        return src
 
-        file_manager.init_folders(cfg)
-
-        self.assertTrue(os.path.exists(src), "initialized=true 时不得再次搬移桌面文件")
+    def _assert_no_second_move(self, src):
+        self.assertTrue(os.path.exists(src), "损坏配置不得再次搬移桌面文件")
         self.assertFalse(
             os.path.exists(os.path.join(self.storage, "办公文件", "report.doc")),
             "损坏配置不应触发二次搬移",
         )
         # 全程只在临时目录内
         self.assertTrue(os.path.abspath(src).startswith(self.tmp))
+
+    def test_corrupt_config_keeps_initialized_and_avoids_second_move(self):
+        # 一份「已初始化过」但被写坏的配置（模拟写中断留下的半截 JSON）
+        self.write_raw('{\n  "initialized": true,\n  "categories": [')
+
+        cfg = config.load_config()
+        src = self._prepare(cfg)
+        file_manager.init_folders(cfg)
+
+        # 先断言「没发生二次搬移」（可观测的损害），再断言 initialized 状态
+        self._assert_no_second_move(src)
+        self.assertTrue(cfg["initialized"], "损坏配置必须保留 initialized，避免二次搬移")
+
+    def test_truncated_before_initialized_avoids_second_move(self):
+        # AW-15 实测的损坏形态：截断在 initialized 之前（旧的非原子写最可能产生）
+        self.write_raw('{"categories": [{"name": "办公文件", "extensions": ["doc"]}')
+
+        cfg = config.load_config()
+        src = self._prepare(cfg)
+        file_manager.init_folders(cfg)
+
+        self._assert_no_second_move(src)
+        self.assertTrue(cfg["initialized"], "截断在 initialized 之前也必须按「跑过」处理")
+
+    def test_nested_initialized_key_avoids_second_move(self):
+        # 嵌套的 initialized=false 在前 → 旧的正则抢救会返回 False（危险方向）
+        self.write_raw(
+            '{"nested": {"initialized": false}, "initialized": true, "categories": ['
+        )
+
+        cfg = config.load_config()
+        src = self._prepare(cfg)
+        file_manager.init_folders(cfg)
+
+        self._assert_no_second_move(src)
+        self.assertTrue(cfg["initialized"])
+
+    def test_undecodable_config_avoids_second_move(self):
+        with open(self.config_path, "wb") as f:
+            f.write(b"\xff\xfe\x00\x01not-utf8")
+
+        cfg = config.load_config()
+        src = self._prepare(cfg)
+        file_manager.init_folders(cfg)
+
+        self._assert_no_second_move(src)
+        self.assertTrue(cfg["initialized"])
+
+    def test_missing_config_is_still_treated_as_first_run(self):
+        # 这条不能改坏：新装用户第一次跑必须仍然搬移桌面文件
+        self.assertFalse(os.path.exists(self.config_path))
+
+        cfg = config.load_config()
+        self.assertFalse(cfg["initialized"], "文件不存在 = 真正的首次运行")
+
+        src = self._prepare(cfg)
+        file_manager.init_folders(cfg)
+
+        moved = os.path.join(self.storage, "办公文件", "report.doc")
+        self.assertTrue(os.path.isfile(moved), "首次运行必须把匹配文件搬进分类文件夹")
+        self.assertFalse(os.path.exists(src), "首次运行后桌面上不应再有源文件")
+        self.assertTrue(os.path.abspath(moved).startswith(self.tmp))
 
 
 if __name__ == "__main__":
