@@ -15,6 +15,7 @@ import errno
 import logging
 import os
 import shutil
+import time
 import ctypes
 from collections import namedtuple
 from ctypes import wintypes
@@ -35,6 +36,16 @@ MoveStats = namedtuple(
 # 竞态下换名重试上限：_resolve_conflict 已保证正常情况不冲突，
 # 这里只兜底「解析出目标名之后、原子占用之前被别的进程抢占」的极窄窗口。
 _CONFLICT_RETRIES = 100
+
+# ── 文件稳定性判定（AW-7） ───────────────────────────────
+#
+# 文件监控（file_watcher）在归类前必须确认文件「已经写完」。watchdog 的
+# created/modified 事件只说明「有写入发生」，而 500ms 防抖也挡不住仍在进行的大文件
+# 复制：复制方每写一块都会刷新事件，但两次事件之间的空档足以让旧实现把**半个文件**
+# 移走——复制方随后继续写的是那个已被移走的句柄，用户拿到的却是残缺副本。
+# 判定方式：间隔采样 `os.path.getsize`，连续两次相同即认为写完。
+DEFAULT_STABLE_INTERVAL = 0.5  # 两次采样之间的间隔（秒）
+DEFAULT_STABLE_SAMPLES = 2     # 判定所需的采样次数（两个样本相等即稳定）
 
 # 本模块的日志器。搬移失败（尤其是留下半成品残留）必须让用户/开发者看得见，
 # 不能再像旧实现那样 `return None, None` 把 `.residual` 静默吞掉。
@@ -71,6 +82,96 @@ def did_move(result):
     供调用方（含 GUI 拖拽路径）使用；本函数是纯函数，便于单测。
     """
     return result is not None and result[1] is not None
+
+
+def is_stable(sizes, min_samples=DEFAULT_STABLE_SAMPLES):
+    """
+    **纯函数**：判断一串按时间顺序采样到的文件大小是否「稳定」（写完了）。
+
+    规则（AW-7）：
+    - 样本不足 `min_samples` → 不稳定（还没比过，不能冒险归类）；
+    - **最后两个样本相等** → 稳定（大小不再变）；
+    - 大小仍在变（最后两个不等）→ 不稳定。
+
+    抽成纯函数（注入 `sizes` 序列、无副作用）是为了可单测：真实采样涉及
+    sleep 与文件系统，无法在用例里稳定复现「正在复制」，但
+    「`[100, 200]` → 不稳定 / `[100, 100]` → 稳定」这类判定逻辑可以精确断言。
+    """
+    if len(sizes) < min_samples:
+        return False
+    return sizes[-1] == sizes[-2]
+
+
+def stable_files(paths, getsize=None, interval=DEFAULT_STABLE_INTERVAL,
+                 sleep=time.sleep):
+    """
+    只读文件系统：对一批路径做「间隔采样大小、连续两次相同」的稳定性判定（AW-7）。
+
+    返回 `(stable, unstable)`：已写完（可归类）的路径、仍在写入（应稍后重试）的路径。
+
+    依赖全部可注入，便于单测（不真等、可模拟复制过程）：
+    - `getsize`：取大小的接口，默认 `os.path.getsize`；
+    - `sleep`：采样间隔的接口，默认 `time.sleep`（单测注入假 sleep 即可在「等待」
+      期间改动真实临时文件，从而在真实文件系统上复现「正在复制」）；
+    - `interval`：两次采样之间的间隔。
+
+    ⚠️ 整批**共享一次等待**，而不是逐文件 sleep：本函数在 GUI 线程
+    （`file_watcher._process_pending` 是 QTimer 槽）被调用，逐文件 sleep 会让
+    一批 N 个文件卡住 `N × interval` 秒。
+
+    ⚠️ 读不到大小的路径（已被删除 / 权限不足 / 采样途中消失）归入 `unstable`：
+    宁可晚点再试，也不要在读不到大小时冒险搬走半成品。
+    """
+    if getsize is None:
+        getsize = os.path.getsize
+
+    first = {}
+    for p in paths:
+        try:
+            first[p] = getsize(p)
+        except OSError:
+            pass  # 读不到 → 不进 second，最终归为 unstable
+
+    if interval:
+        sleep(interval)
+
+    stable, unstable = [], []
+    for p in paths:
+        if p not in first:
+            unstable.append(p)
+            continue
+        try:
+            second = getsize(p)
+        except OSError:
+            unstable.append(p)
+            continue
+        (stable if is_stable([first[p], second]) else unstable).append(p)
+    return stable, unstable
+
+
+# 待归类文件本轮的处理动作（AW-7）。
+ACTION_CATEGORIZE = "categorize"  # 已稳定 → 归类
+ACTION_RETRY = "retry"            # 仍在写入 → 稍后重试
+ACTION_GIVE_UP = "give_up"        # 重试太多次仍不稳定 → 放弃（留在桌面）
+
+
+def stability_decision(stable, retries, max_retries):
+    """
+    **纯函数**：决定一个待归类文件本轮如何处理（AW-7 的重试策略）。
+
+    - 已稳定 → `ACTION_CATEGORIZE`；
+    - 不稳定且重试次数未达上限 → `ACTION_RETRY`（稍后重试）；
+    - 不稳定且已达上限 → `ACTION_GIVE_UP`（**留在桌面**，绝不冒险搬走半成品；
+      例如被持续写入的文件，用户可稍后手动拖入面板）。
+
+    `retries` 是**已经**重试过的次数。抽成纯函数是为了让「重试上限」这条策略可单测
+    ——它同时防住「搬走半成品」与「无限重试」两种坏结果。
+    """
+    if stable:
+        return ACTION_CATEGORIZE
+    if retries >= max_retries:
+        return ACTION_GIVE_UP
+    return ACTION_RETRY
 
 
 def get_desktop_path(config):

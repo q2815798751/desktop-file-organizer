@@ -883,5 +883,174 @@ class TestDeleteResultCounting(unittest.TestCase):
         self.assertEqual(self._count_deleted([(0, False), (0, 0)]), 2)
 
 
+# ── AW-7：文件稳定性判定 ──────────────────────────────────
+
+class TestIsStable(unittest.TestCase):
+    """is_stable 纯函数：注入 sizes 序列，断言稳定性判定规则。"""
+
+    def test_two_equal_samples_is_stable(self):
+        self.assertTrue(file_manager.is_stable([100, 100]))
+
+    def test_zero_size_stable(self):
+        # 空文件创建后一直为空 → 连续两次 0 → 稳定
+        self.assertTrue(file_manager.is_stable([0, 0]))
+
+    def test_growing_size_is_unstable(self):
+        # 大文件正在复制：大小还在变 → 不稳定（本项要防的核心场景）
+        self.assertFalse(file_manager.is_stable([100, 200]))
+
+    def test_shrinking_size_is_unstable(self):
+        self.assertFalse(file_manager.is_stable([200, 100]))
+
+    def test_single_sample_is_unstable(self):
+        # 只有一个样本 = 还没比过，不能冒险归类
+        self.assertFalse(file_manager.is_stable([100]))
+
+    def test_empty_is_unstable(self):
+        self.assertFalse(file_manager.is_stable([]))
+
+    def test_only_last_two_samples_decide(self):
+        # 判定只看最后两个样本：早期变化不影响、最近一次仍在变则不稳定
+        self.assertTrue(file_manager.is_stable([10, 20, 30, 30]))
+        self.assertFalse(file_manager.is_stable([10, 10, 10, 20]))
+
+    def test_min_samples_respected(self):
+        self.assertFalse(file_manager.is_stable([5, 5], min_samples=3))
+        self.assertTrue(file_manager.is_stable([5, 5, 5], min_samples=3))
+
+
+class TestStableFilesIntegration(TempDirsMixin, unittest.TestCase):
+    """stable_files 的真实文件系统行为（AW-7，临时文件）。"""
+
+    def test_unchanged_file_is_stable(self):
+        # 真实 os.path.getsize + 真实临时文件：不再改动 → 连续两次相同 → 稳定
+        p = self.write_file(os.path.join(self.tmp, "a.txt"), "hello")
+        stable, unstable = file_manager.stable_files([p], interval=0.0)
+        self.assertEqual(stable, [p])
+        self.assertEqual(unstable, [])
+
+    def test_file_growing_between_samples_is_unstable(self):
+        # 注入假 sleep，在「等待」期间向真实文件追加内容 → 复现「正在复制」
+        p = self.write_file(os.path.join(self.tmp, "big.bin"), "x")
+
+        def grow(_seconds):
+            with open(p, "a", encoding="utf-8") as f:
+                f.write("y" * 1000)
+
+        stable, unstable = file_manager.stable_files([p], interval=1, sleep=grow)
+        self.assertEqual(stable, [])
+        self.assertEqual(unstable, [p])
+
+    def test_missing_file_is_unstable(self):
+        missing = os.path.join(self.tmp, "nope.txt")
+        stable, unstable = file_manager.stable_files([missing], interval=0.0)
+        self.assertEqual(stable, [])
+        self.assertEqual(unstable, [missing])
+
+    def test_file_removed_during_sampling_is_unstable(self):
+        p = self.write_file(os.path.join(self.tmp, "gone.txt"), "x")
+
+        def remove(_seconds):
+            os.remove(p)
+
+        stable, unstable = file_manager.stable_files([p], interval=1, sleep=remove)
+        self.assertEqual(stable, [])
+        self.assertEqual(unstable, [p])
+
+    def test_batch_partitioned_by_growth(self):
+        steady = self.write_file(os.path.join(self.tmp, "steady.txt"), "abc")
+        growing = self.write_file(os.path.join(self.tmp, "growing.txt"), "a")
+
+        def grow_one(_seconds):
+            with open(growing, "a", encoding="utf-8") as f:
+                f.write("b" * 100)
+
+        stable, unstable = file_manager.stable_files(
+            [steady, growing], interval=1, sleep=grow_one
+        )
+        self.assertEqual(stable, [steady])
+        self.assertEqual(unstable, [growing])
+
+    def test_batch_shares_single_wait(self):
+        # 整批只 sleep 一次（不是逐文件 sleep）——否则 GUI 线程会卡 N × interval
+        paths = [
+            self.write_file(os.path.join(self.tmp, f"f{i}.txt"), "x")
+            for i in range(3)
+        ]
+        calls = []
+
+        def fake_sleep(seconds):
+            calls.append(seconds)
+
+        file_manager.stable_files(paths, interval=0.25, sleep=fake_sleep)
+        self.assertEqual(calls, [0.25])
+
+    def test_injected_getsize_sequence(self):
+        # 注入 getsize 序列（单路径会被调用两次：采样前 / 采样后）
+        growing = iter([10, 20])
+        self.assertEqual(
+            file_manager.stable_files(
+                ["p"], getsize=lambda _p: next(growing), interval=0.0
+            ),
+            ([], ["p"]),
+        )
+        steady = iter([10, 10])
+        self.assertEqual(
+            file_manager.stable_files(
+                ["p"], getsize=lambda _p: next(steady), interval=0.0
+            ),
+            (["p"], []),
+        )
+
+    def test_getsize_error_is_unstable(self):
+        def boom(_p):
+            raise OSError("boom")
+
+        self.assertEqual(
+            file_manager.stable_files(["p"], getsize=boom, interval=0.0),
+            ([], ["p"]),
+        )
+
+
+class TestStabilityDecision(unittest.TestCase):
+    """stability_decision 纯函数：重试策略。"""
+
+    def test_stable_categorizes(self):
+        self.assertEqual(
+            file_manager.stability_decision(True, 0, 20),
+            file_manager.ACTION_CATEGORIZE,
+        )
+
+    def test_stable_ignores_retries(self):
+        self.assertEqual(
+            file_manager.stability_decision(True, 999, 3),
+            file_manager.ACTION_CATEGORIZE,
+        )
+
+    def test_unstable_retries(self):
+        self.assertEqual(
+            file_manager.stability_decision(False, 0, 20),
+            file_manager.ACTION_RETRY,
+        )
+
+    def test_unstable_at_limit_gives_up(self):
+        self.assertEqual(
+            file_manager.stability_decision(False, 20, 20),
+            file_manager.ACTION_GIVE_UP,
+        )
+
+    def test_unstable_beyond_limit_gives_up(self):
+        self.assertEqual(
+            file_manager.stability_decision(False, 21, 20),
+            file_manager.ACTION_GIVE_UP,
+        )
+
+    def test_zero_max_retries_gives_up_immediately(self):
+        self.assertEqual(
+            file_manager.stability_decision(False, 0, 0),
+            file_manager.ACTION_GIVE_UP,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
