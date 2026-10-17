@@ -842,12 +842,44 @@
       仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在；
       `git status` 仅 5 个预期改动文件）。
 
-- [ ] **AW-9 修搜索时 `getsize` 崩溃（正确性）**
+- [x] **AW-9 修搜索时 `getsize` 崩溃（正确性）**
       问题：`dashboard.py:1377` 对搜索结果条目调 `os.path.getsize`，
       若文件在「列出」与「取大小」之间被删/被移，`OSError` 未捕获 → 整个搜索崩溃。
       修法：加异常处理，取不到大小时显示占位（如 `—`）而不是崩。
       这一段是 GUI 代码，把「安全取大小」抽成纯函数（例如 `safe_size(path)`）再单测。
       新增用例：不存在的路径 → 返回占位值不抛异常；正常文件 → 返回真实大小。
+      ✅ 已完成（2026-10-17）：实际 **242** 个用例（234 → 242，净增 8 条，全在
+      `tests/test_file_manager.py` 新增 `TestSafeSize`），`python -m unittest discover -s tests -v`
+      全绿。**占位值 = `SIZE_PLACEHOLDER = "—"`（em dash）**。
+      - **怎么让它可验证（沿用 AW-5/7/8/18 的套路）**：新增窄接口
+        `safe_size(path, getsize=os.path.getsize)` —— **纯函数**，放在无 PyQt5 依赖的
+        `file_manager.py`（可直接 import），故可单测；`getsize` 可注入以便喂各种 `OSError`
+        子类。正常文件返回真实字节数（int）；取不到时一律吞掉 `OSError` 并返回占位字符串
+        `SIZE_PLACEHOLDER`，**绝不向上抛**。
+      - **`dashboard.py` 接线**：搜索（`_on_search`）与分类列表（`_load_files`）两处
+        `self._format_size(os.path.getsize(full_path))` 都改为
+        `raw = safe_size(full_path); size_str = raw if isinstance(raw, str) else self._format_size(raw)`
+        （占位是 str、真实大小是 int，用 `isinstance` 区分是否再走 `_format_size`）。
+        两处都属同一缺陷类（「列出」与「取大小」之间文件消失），一并修掉。
+        `dashboard.py` **未 import**，只做 `py_compile` 静态检查（dashboard/desktop_panel/
+        panel_manager/main/file_watcher/file_manager 均通过）。
+      - 新增 8 条用例：不存在路径 → 占位不抛；正常文件 → 真实大小（且是 int）；
+        路径是目录 → 真实 `os.path.getsize` 返回 int（不抛、非占位，与「取不到」区分）；
+        权限拒绝（注入 `PermissionError`）→ 占位；失效符号链接 → 占位
+        （本机普通用户无 `os.symlink` 权限、实测 `WinError 1314`，无权限时退化为注入
+        `FileNotFoundError` 忠实模拟，有权限则走真实文件系统）；
+        `FileNotFoundError`/`PermissionError`/`NotADirectoryError`/`IsADirectoryError`/`OSError`
+        五种 `OSError` 子类逐一被吞成占位；注入 getsize 收到原始 path 的窄接口契约；
+        占位符是 str 且与真实大小（int）类型可区分。
+      反向验证（**定点破坏**，未用 `git checkout origin/master -- <文件>` 那种超集回退）：
+      把 `safe_size` 的 `try/except OSError` 换成裸 `return getsize(path)  # BREAK-AW9`
+      （还原旧的「直接抛」行为），`git diff -- file_manager.py` 确认 `BREAK-AW9` 标记已生效
+      → 重跑得 **8 errors**（1 broken_symlink + 5 个 `each_oserror_subclass` 子测试
+      + 1 missing_path + 1 permission_denied），正是所有依赖占位符的用例；
+      装回修复、`grep BREAK` 0 命中后恢复 242 全绿。
+      全程 `tempfile.TemporaryDirectory()`（真实临时文件/目录，无真实目录写操作）、
+      未运行 `main.py` / `restore_files.py`，未在真实桌面验证，仓库根目录未生成 `config.json`
+      （`ls config.json` 显式确认不存在；`git status` 仅 3 个预期改动文件）。
 
 - [ ] **AW-10 修 `config.py` 浅拷贝污染默认配置（正确性）**
       问题：`config.py:74-77` 用 `dict(DEFAULT_CONFIG)` 做浅拷贝，
