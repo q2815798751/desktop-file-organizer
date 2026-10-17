@@ -621,9 +621,13 @@ class TestMoveIntoCategory(TempDirsMixin, unittest.TestCase):
 
 class TestMoveIntoCategoryRejectsStorageAncestors(TempDirsMixin, unittest.TestCase):
     """
-    旧防护只拒绝「分类文件夹本身」和「存储根」这一层。把存储根的**父目录**
-    （如 `Documents`）拖进面板，会把整个存储目录连同所有分类搬进某个分类 →
-    存储根位移、配置全部失效。现在必须拒绝存储根**及其所有祖先**。
+    `move_into_category` 必须拒绝把存储根**及其所有祖先**移入分类。
+
+    ⚠️ **定位（AW-4 复查实测更正）**：这是**纵深防御 + UX 改善**，**不是**在堵一个
+    可达的数据丢失缺陷。早期描述「把存储根父目录拖进来 → 整个存储目录连同分类被搬走 →
+    存储根位移、配置全部失效」经**实测证伪**：关掉 guard 后四级祖先全部因
+    「目标目录必在源之内、`os.rename` 以 WinError 5 失败」而返回 `(None, None)`，
+    存储根纹丝不动。本校验的价值是**干净的静默拒绝**（而不是尝试后失败并记日志）。
 
     存储根特意放深几层（tmp/base/sub/storage），以便测「多层祖先」，
     并确认 `startswith` 会误伤的前缀兄弟目录（`stor`）仍能正常收纳。
@@ -736,6 +740,71 @@ class TestMoveIntoCategoryRejectsStorageAncestors(TempDirsMixin, unittest.TestCa
         drive = os.path.splitdrive(self.storage)[0].upper()
         other = "Z:\\x" if drive != "Z:" else "Y:\\x"
         self.assertIsNone(file_manager.storage_ancestor_error(self.storage, other))
+
+    # —— AW-20：大小写变体（锁定对 commonpath 实现细节 + 参数顺序的依赖）——
+    #
+    # 大小写不敏感**不是本函数的显式意图**，而是依赖 `os.path.commonpath` 内部先
+    # `lower()` 比较、却用 `paths[0]` 的原始大小写拼回返回值。所以「src 在前」时
+    # `common == src` 恒真；顺序写反就会在大小写不同的输入上漏判。以下用例把它钉住。
+
+    def test_case_variant_src_uppercase_is_rejected(self):
+        # 存储根 `C:\storage`、源 `C:\STORAGE`（大小写不同）→ 仍必须拒绝
+        err = file_manager.storage_ancestor_error(r"C:\storage", r"C:\STORAGE")
+        self.assertIsNotNone(err, "大小写不同的同一条路径必须仍被判为祖先")
+        self.assertTrue(err.strip())
+
+    def test_case_variant_root_uppercase_is_rejected(self):
+        # 反过来：存储根 `C:\STORAGE`、源 `C:\storage` → 仍必须拒绝
+        err = file_manager.storage_ancestor_error(r"C:\STORAGE", r"C:\storage")
+        self.assertIsNotNone(err, "大小写不同的同一条路径必须仍被判为祖先")
+        self.assertTrue(err.strip())
+
+    def test_commonpath_argument_order_is_load_bearing(self):
+        # 直接锁定实现细节：`commonpath([src, root])` 返回的是 **src** 的大小写，
+        # 故 `common == src` 成立；顺序反成 `[root, src]` 后返回值带 root 的大小写，
+        # 在大小写不同的输入上 `common == src` 会失配 → 漏判。这条用例把「src 必须
+        # 在前」这个硬前提钉住：若有人把 `storage_ancestor_error` 里的参数顺序调换，
+        # 上面两条大小写用例会变红（本用例单独也说明了顺序为何是关键）。
+        src, root = r"C:\STORAGE", r"C:\storage"
+        self.assertEqual(os.path.commonpath([src, root]), src)   # 返回 src 的大小写
+        self.assertNotEqual(os.path.commonpath([root, src]), src)  # 反序则失配
+
+    # —— AW-20：`\\?\` 扩展长度前缀的已知行为（如实标注为「放行」）——
+
+    def test_extended_prefix_is_known_passthrough_but_not_exploitable(self):
+        # 已知行为（**如实标注为放行**，不掩盖）：`\\?\<盘符>:\...` 经 abspath 后
+        # **保留 `\\?\` 前缀**，commonpath 认盘符 `\\?\C:` ≠ `C:` → ValueError →
+        # `storage_ancestor_error` 返回 None（guard 被绕过）。选择「标注为放行」而非
+        # 「改代码拒绝」：这是不可达的纸面缺口——分类目录必在被拖入源之内，真实
+        # `os.rename` 会以 WinError 5 失败；且拖拽源来自 Qt 的 QUrl.toLocalFile()，
+        # 资源管理器不会产生 `\\?\`。改代码去归一化前缀属另一条更宽的改动，超出本项范围。
+        ext_src = "\\\\?\\" + self.storage  # \\?\<tmp>\storage
+        self.assertEqual(os.path.abspath(ext_src), ext_src, "abspath 应保留 \\?\\ 前缀")
+
+        # 1) 纯函数层：确认 guard 真的被绕过（返回 None，而不是拒绝）
+        self.assertIsNone(
+            file_manager.storage_ancestor_error(self.storage, ext_src),
+            "\\?\\ 前缀会绕过祖先 guard——这是已知行为，本用例如实钉住它",
+        )
+
+        # 2) 端到端：guard 被绕过 → `_move_no_clobber` **确实被调用**（spy 证明），
+        #    但因「目标目录在源之内」，真实 os.rename 以 WinError 5 失败，
+        #    最终仍返回 (None, None)，存储根纹丝不动（实际不可利用）。
+        with mock.patch(
+            "file_manager._move_no_clobber", wraps=file_manager._move_no_clobber
+        ) as spy:
+            result = file_manager.move_into_category(self.cfg, self.pics, ext_src)
+        self.assertTrue(spy.called, "\\?\\ 前缀确实绕过了 guard（已知行为）")
+        self.assertEqual(result, (None, None), "虽然 guard 被绕过，但实际搬移失败、未造成危害")
+        self.assertTrue(os.path.isdir(self.storage), "存储根必须原地不动")
+        self.assertTrue(
+            os.path.isdir(os.path.join(self.storage, "图片")),
+            "分类目录必须原地不动",
+        )
+        self.assertEqual(
+            sorted(os.listdir(self.storage)), ["图片"],
+            "存储根下只应多出分类目录，没有任何东西被搬走",
+        )
 
 
 # ── did_move：调用方判定（失败不能被当成功）──────────────

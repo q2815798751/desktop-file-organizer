@@ -321,17 +321,36 @@ def storage_ancestor_error(storage_root, src_path):
     ⚠️ 这是**源路径**的校验（拖进来的东西），与 `category_folder_error` /
     `realpath_escape_error` 那两个**目标路径**校验不是一回事，别混用。
 
-    ⚠️ 为什么必须拒绝（AW-4）：`move_into_category` 的旧防护只拒绝「分类文件夹本身」
-    和「存储根这一层」。把存储根的**父目录**（如 `Documents`、`~`）拖进面板时，
-    `_move_no_clobber` 会把**整个存储目录连同所有分类**搬进某个分类里，
-    导致存储根位移、`config` 里记录的路径全部失效、用户的文件"消失"在错误位置。
-    所以必须拒绝存储根**及其所有祖先**。
+    ⚠️ **定位（AW-4 复查实测更正）：这是「纵深防御 + UX 改善」，不是在堵一个可达的
+    数据丢失缺陷。** 早期勘察报告写的「把存储根父目录拖进来会把整个存储目录连同分类
+    一起搬走 → 存储根位移、`config` 记录的路径全部失效」经**实测证伪**：关掉本校验后，
+    把存储根 / 父 / 祖父 / 顶层祖先四级分别拖入分类，目标目录（`存储根\\分类\\...`）
+    **必在被拖入目录之内**，`os.rename` 一律以 `WinError 5`（拒绝访问）失败，
+    四级祖先全部返回 `(None, None)`，**存储根纹丝不动**。本校验的价值是给出
+    **干净的静默拒绝**，而不是「尝试搬移 → 失败 → 记一条 ERROR 日志」。
 
     ⚠️ 不能用 `startswith` 判前缀：`...\\sub\\stor` 是 `...\\sub\\storage` 的字符串前缀，
     但它只是**兄弟目录**、并非祖先——`startswith` 会把它误判成祖先，从而拒绝一次
     完全正常的收纳。这里用 `os.path.commonpath`：`src` 是存储根的祖先 ⟺
     二者的公共路径**恰等于 src 本身**（`commonpath` 对不同盘符抛 `ValueError`，
     那种情况 src 不可能是祖先，返回 None）。
+
+    ⚠️ **参数顺序是硬前提：必须写 `commonpath([src, root])`，src 在前。**
+    本函数对大小写不敏感**不是显式意图**，而是依赖 `os.path.commonpath` 的实现细节：
+    它内部先把各路径 `lower()` 再逐组件比较（故 `C:\\STORAGE` 与 `C:\\storage` 视为同一
+    路径），**但返回值用 `paths[0]` 的原始大小写拼回**。于是「src 在前」时 `common == src`
+    恒真；一旦顺序写反成 `[root, src]`，返回值带的是 **root** 的大小写，遇到大小写不同的
+    输入时 `common == src` 失配 → **漏判祖先（放行）**。
+    `tests/test_file_manager.py::TestMoveIntoCategoryRejectsStorageAncestors` 的
+    `test_case_variant_*` 用例把这条顺序前提钉住了。
+
+    ⚠️ **已知放行缺口（如实标注，不掩盖）**：`\\?\\C:\\storage` 这类**扩展长度前缀**路径
+    经 `os.path.abspath` 后**保留 `\\?\\` 前缀**，`os.path.commonpath` 认盘符
+    `\\?\\C:` ≠ `C:` → 抛 `ValueError` → 本函数**放行**（guard 被绕过）。
+    但**实际不可利用**：分类目录必在被拖入源之内，随后真实 `os.rename` 会以 `WinError 5`
+    失败，最终仍返回 `(None, None)`；且 `src` 来自 Qt 拖拽的 `QUrl.toLocalFile()`
+    真实本地路径，资源管理器不会产生 `\\?\\`。用例
+    `test_extended_prefix_is_known_passthrough_but_not_exploitable` 钉住这条已知行为。
     """
     try:
         root = os.path.abspath(storage_root)
@@ -662,8 +681,11 @@ def move_into_category(config, category, src_path):
         return None, None
 
     # 源是存储根**或其任一祖先目录** → 拒绝（AW-4）。
-    # 旧防护只挡「存储根这一层」，把存储根的父目录（如 Documents）拖进来会把
-    # 整个存储目录连同分类一起搬走 → 存储根位移、配置全部失效。
+    # ⚠️ 这是**纵深防御 + UX 改善**，不是在堵一个可达的数据丢失缺陷：把存储根的父目录
+    # （如 Documents）拖进来时，目标目录（`存储根\分类\...`）必在源之内，`os.rename`
+    # 会以 WinError 5 失败——即使没有本校验，存储根也纹丝不动（AW-4 复查实测**证伪**了
+    # 旧描述「存储根位移、配置全部失效」）。本校验让这种情况变成**干净的静默拒绝**，
+    # 而不是「尝试搬移 → 失败 → 记一条 ERROR 日志」。
     if storage_ancestor_error(get_storage_root(config), src_abs):
         return None, None
 
