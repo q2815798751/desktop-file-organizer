@@ -580,7 +580,7 @@
       仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在；`git status` 仅 3 个
       预期改动文件）。
 
-- [ ] **AW-6 修 `restore_files.py` 硬编码路径与分类清单（数据安全）**
+- [x] **AW-6 修 `restore_files.py` 硬编码路径与分类清单（数据安全）**
       问题：`restore_files.py:12` 把桌面写死成 `~/Desktop`，无视 `config.desktop_path`
       （桌面被 OneDrive 重定向时会恢复到错位置）；`restore_files.py:13-15` 硬编码 5 个默认分类名，
       **用户自建分类里的文件永远恢复不了**。
@@ -589,6 +589,41 @@
       新增用例：构造一份含自建分类的配置 + 临时目录结构 → 断言恢复清单覆盖自建分类，
       且目标目录用的是配置里的 `desktop_path` 而不是写死的 `~/Desktop`。
       **这个脚本会移动真实文件，测试必须全程在临时目录里跑。**
+      ✅ 已完成（2026-10-17）：实际 **187** 个用例（165 → 187，净增 22 条，全在新增的
+      `tests/test_restore_files.py`），`python -m unittest discover -s tests -v` 全绿。
+      修法（把「计算恢复计划」抽成纯函数，执行搬移仍留在脚本里）：
+      - 脚本改为 `import config`，`restore()` 用 `config.load_config()` 拿配置；
+        **删掉写死的 `DESKTOP`/`CATEGORY_FOLDERS`/本地 `CONFIG_PATH`**。
+      - 新增纯函数 `resolve_desktop(cfg)`（取 `desktop_path`，空则回退 `~/Desktop`，与
+        `file_manager.get_desktop_path` 一致）、`resolve_storage_root(cfg)`、
+        `category_folders(cfg)`（遍历实际分类，返回 `[(显示名, 磁盘目录名)]`，
+        磁盘名取 `folder` 字段、缺失/为空退回 `name`、按目录名去重）、
+        `build_restore_plan(cfg)`（**只读文件系统、绝不移动文件**，返回
+        `(desktop, [(分类标签, src, dest_dir, filename), ...])`）。
+      - 顺带兜住「配置驱动」新引入的越界风险：`_category_dir` 用 `commonpath` 复检分类目录
+        必须落在存储根内（绝对路径 / `..` 逃出 root 则跳过），避免手工编辑的 `folder`
+        让脚本扫描存储根之外并把那里的文件搬回桌面（旧脚本目录名写死、天然无此风险）。
+      - 判定规则：遍历实际分类 → 解析存储根下分类目录（`folder`，越界跳过）→ 目录不存在跳过
+        → 只收普通文件（不递归子目录）；目标目录恒为配置的 `desktop_path`；
+        同名冲突仍沿用 `<name>_restored(<n>)<ext>`。
+      新增 22 条用例，覆盖：`category_folders` 含自建分类 / `folder`≠显示名 / 缺失或空退回 `name`
+      / 去重 / 跳过坏条目；`resolve_*` 取值与回退；`build_restore_plan` 的 desktop 来自配置
+      **而非** `~/Desktop`、清单覆盖自建分类、dest 恒为配置桌面、跳过不存在目录、只收文件不递归、
+      越界 folder 被拒；端到端 `restore()`（**`mock.patch("config.CONFIG_PATH")`** +
+      `tempfile.TemporaryDirectory()`，并把 `os.path.expanduser` 重定向到临时假家目录——
+      即使修复被撤掉，回退路径也只会落到临时目录，绝不碰真实 `~/Desktop`）断言自建分类文件
+      落到配置桌面、同名不覆盖、确实经 `config.load_config()` 读配置。
+      反向验证（**两步定点破坏**，未用 `git checkout origin/master -- <文件>` 那种超集回退；
+      每步先 `git diff` 确认 `BREAK` 标记生效、`grep BREAK` 命中）：
+      (a) 把 `build_restore_plan` 的 desktop 改回写死的 `~/Desktop`（`BREAK-A`）→ 重跑得
+          **5 failed**，正是 5 条判 desktop 来源的用例（含端到端两条）；
+      (b) 把分类清单改回写死的 5 个默认名（`BREAK-B`）→ 重跑得 **3 failed**，正是
+          `test_plan_covers_user_created_category` / `test_plan_uses_folder_field_for_directory`
+          / `test_restore_moves_custom_category_file_to_config_desktop`。
+      装回后 `grep BREAK` 0 命中、恢复 187 全绿。
+      全程未运行 `main.py` / `restore_files.py` 的 `__main__` 入口（仅单测内调用 `restore()`
+      且全部路径打桩到临时目录），未在真实桌面验证，仓库根目录未生成 `config.json`
+      （`ls config.json` 显式确认不存在；`git status` 仅 2 个预期改动文件）。
 
 - [ ] **AW-7 修文件监控搬走「半成品」（健壮性，但有真实数据风险）**
       问题：`file_watcher.py:32,66-85` 防抖只有 500ms 且**不判断文件是否写完**，
