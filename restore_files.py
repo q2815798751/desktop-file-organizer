@@ -11,13 +11,30 @@ AW-6 修复（数据安全）：
 - 「计算恢复计划」抽成**纯函数** `build_restore_plan`（只读文件系统、绝不移动文件），
   便于在临时目录里单测；真正执行搬移的只有 `restore()`。
 
-⚠️ 本脚本会**真实移动文件**。测试必须全程在 `tempfile.TemporaryDirectory()` 里跑，
-并用 `unittest.mock.patch("config.CONFIG_PATH", <临时路径>)` 打桩配置路径。
+AW-21 修复（数据安全）：
+- **junction / 符号链接逃逸复检**：`_category_dir` 在词法校验之后，复用
+  `file_manager.realpath_escape_error` 做 `realpath` 复检。若 `storage_root\\<folder>`
+  已存在且是指向根外的 junction（`mklink /J` 免管理员）或符号链接，**词法校验会放行、
+  文件实际会被搬到存储根之外**（复查已用 `mklink /J` 实测复现：`restore()` 会把
+  `<根外>\\SECRET.txt` 搬回桌面）。复检拒绝该分类，并记 WARNING 日志（可见降级，不静默）。
+- **分类目录名去重按 `os.path.abspath`**：旧实现按原始字符串去重，`shared` 与 `.\\shared`
+  这类等价拼写不会去重，导致计划里同一文件出现两次。
+
+⚠️ 本脚本会**真实移动文件**。测试必须全程在 `tempfile.TemporaryDirectory()` 里跑。
+  ⚠️ `mock.patch("config.CONFIG_PATH", <临时路径>)` **只对当前写法有效**——因为本脚本
+  通过 `config.load_config()` 在**调用时**读模块全局 `config.CONFIG_PATH`。若哪天把配置
+  路径改回**本模块自己的模块级常量**（AW-6 之前的写法），这个 patch 会**静默失效**，
+  测试就会去读仓库根的 `config.json`。测试侧的护栏见 `tests/test_restore_files.py`
+  的 `RestoreTestBase.setUp`（显式断言回退桌面落在临时目录内）。
 """
+import logging
 import os
 import shutil
 
 import config
+import file_manager
+
+logger = logging.getLogger(__name__)
 
 # 与 config / file_manager 保持一致的默认值
 _DEFAULT_STORAGE_NAME = "桌面文件收纳"
@@ -25,8 +42,13 @@ _DEFAULT_STORAGE_NAME = "桌面文件收纳"
 
 def resolve_desktop(cfg):
     """
-    目标桌面目录：取 `config["desktop_path"]`；为空时回退 `~/Desktop`
-    （与 `file_manager.get_desktop_path` 的缺省行为一致）。
+    目标桌面目录：取 `config["desktop_path"]`；为空时回退 `~/Desktop`。
+
+    ⚠️ 与 `file_manager.get_desktop_path` 的**缺省值相同**（都是 `~/Desktop`），
+    但两者的**回退条件不同**：本函数只在 `desktop_path` 为空时回退；
+    `get_desktop_path` 还会在「目录不存在」时也回退到 `~/Desktop`。
+    本函数刻意**不**检查目录是否存在（fail-closed）：恢复目标以配置为准，宁可把文件
+    恢复到一个尚未创建的目录名下，也不擅自改回 `~/Desktop` 而把文件搬到用户没指定的地方。
     """
     desktop = (cfg or {}).get("desktop_path") or ""
     if desktop:
@@ -50,6 +72,9 @@ def category_folders(cfg):
       `folder` 缺失或为空时退回 `name`。这就是「自建分类」能被恢复的关键：
       旧脚本只认 5 个写死的默认目录名，自建分类的文件永远扫描不到。
     - 按目录名去重（多个分类共用同一目录时只扫描一次），保持配置顺序。
+      ⚠️ 去重键是 `os.path.abspath(folder)`（AW-21）：旧实现按**原始字符串**去重，
+      `shared` 与 `.\\shared` 这类**等价拼写**不会去重，计划里同一文件会出现两次
+      （第二条报 `[WinError 2]`，不丢数据但计划不自洽）。
     - 跳过名字不是非空文本的分类（含 `folder` 为非字符串的坏配置）。
     """
     result = []
@@ -62,9 +87,10 @@ def category_folders(cfg):
         if not isinstance(folder, str) or not folder.strip():
             continue
         folder = folder.strip()
-        if folder in seen:
+        key = os.path.abspath(folder)
+        if key in seen:
             continue
-        seen.add(folder)
+        seen.add(key)
         label = name.strip() if isinstance(name, str) and name.strip() else folder
         result.append((label, folder))
     return result
@@ -72,20 +98,37 @@ def category_folders(cfg):
 
 def _category_dir(root, folder):
     """
-    把分类目录名解析成 `root` 内的完整路径；越界（绝对路径，或 `..` 逃出 root）返回 `None`。
+    把分类目录名解析成 `root` 内的完整路径；越界返回 `None`（并记一条 WARNING 日志，
+    **不静默**——`restore()` 是给人跑的脚本，静默跳过会让「某个分类被跳过」无从察觉）。
 
-    旧脚本的目录名是写死的、天然安全；改成配置驱动后必须自己兜住这层，
-    否则手工编辑的 `folder`（如 `..\\..\\evil`）会让脚本扫描存储根之外并把那里的文件搬回桌面。
+    两层校验：
+    1. **词法校验**（abspath + commonpath）：挡住绝对路径、`..` 逃出 root，以及
+       `con` / `aux` / `nul` / `D:evil` 这类会让 `commonpath` 抛 `ValueError` 的怪名字。
+       旧脚本的目录名是写死的、天然安全；改成配置驱动后必须自己兜住这层，
+       否则手工编辑的 `folder`（如 `..\\..\\evil`）会让脚本扫描存储根之外并把那里的文件搬回桌面。
+    2. **realpath 复检**（AW-21，复用 `file_manager.realpath_escape_error`）：
+       若 `root\\<folder>` 已存在且是指向根外的 junction / 符号链接，**词法校验会放行**、
+       文件实际会被搬到存储根之外（复查已用 `mklink /J` 实测复现）。
     """
     root_abs = os.path.abspath(root)
     if os.path.isabs(folder):
+        logger.warning("跳过分类目录 %r：不能是绝对路径", folder)
         return None
     target = os.path.abspath(os.path.join(root_abs, folder))
     try:
         # 用 commonpath 而不是 startswith（避免 `...\sub\stor` 这类前缀兄弟目录误判）
         if os.path.commonpath([target, root_abs]) != root_abs or target == root_abs:
+            logger.warning("跳过分类目录 %r：越出了存储目录 %r", folder, root_abs)
             return None
     except ValueError:
+        # 不同盘符（如 `D:evil`），或 Windows 保留设备名（如 `con`）经 abspath 变成
+        # `\\.\con` —— 一律判越界。
+        logger.warning("跳过分类目录 %r：与存储目录 %r 不在同一盘符（或名字非法）", folder, root_abs)
+        return None
+    # realpath 复检：挡住指向根外的 junction / 符号链接（AW-21）
+    escape = file_manager.realpath_escape_error(root_abs, target)
+    if escape:
+        logger.warning("跳过分类目录 %r：%s", folder, escape)
         return None
     return target
 
