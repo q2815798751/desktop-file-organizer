@@ -188,6 +188,32 @@
       **`init_folders` 的 `first_run=True` 分支**、`_move_matching_files`、`get_files_in_category`。
       （如果 AW-2 已经补过，这里只需确认并补漏。）
 
+- [ ] **AW-16 补跨盘分支的测试覆盖 + 清掉半拷贝残留（AW-2 复查实测，健壮性）**
+      > 编号后补，位置在此 = 排在 AW-15 之后、AW-3 之前。
+
+      AW-2 的对抗性复查**确认「TOCTOU 窗口已真的关掉」**：四种路径组合（文件/目录 × 同盘/跨盘）
+      都实测过，含 C:→E: 真实跨盘、两线程并发、50 轮 × 4 线程压力测试，无一例覆盖或污染。
+      我原本怀疑的「copytree 不原子」是**假警报**——`shutil.copytree` 内部第一步就是
+      `os.makedirs(dst, exist_ok=False)`，本身就原子占用目标名。
+      **但它带出三个次要却真实的问题**：
+      1. **跨盘目录分支零测试覆盖**：`grep EXDEV|copytree|os.rename tests/` 无命中，
+         所有目录用例都在同一个 tempdir（同盘），只走 `os.rename` 分支。
+         也就是说**跨盘正确性完全靠 `shutil.copytree` 的实现细节兜底，没有任何回归保护**——
+         将来 Python 改了 copytree 的行为，我们不会知道。
+         修法：补一条用例，`mock.patch` 让 `os.rename` 抛 `OSError(EXDEV)`，
+         断言走 copytree 分支且行为正确（目标已占时改名重试、不覆盖）。
+      2. **半拷贝残留没有清理**：`copytree` 中途失败会留下一个**部分拷贝的 dest 目录**
+         （对他人无覆盖、src 保留，但垃圾残留在存储目录里）；文件路径的跨盘 `copy2`
+         中途失败同理可能残留非空占位文件。文件路径有 `_release_placeholder` 清理，
+         **目录路径没有对应机制**。修法：目录分支也加失败清理，或至少把残留路径上报到
+         `MoveResult`，让调用方能告诉用户「有个半成品目录要手工清」。
+      3. **整套 no-clobber 保证隐含依赖 Windows 的 `os.rename` 语义**：
+         本机（Python 3.14 / Windows）`os.rename` 对已存在的文件或目录**一律**
+         `FileExistsError`，从不替换；而 POSIX 的 `os.rename` **会替换**。
+         这个项目是 Windows 专用（大量 `ctypes.windll`），所以**不是 bug**，
+         但**必须在代码注释里写明这个前提**，否则将来有人移植会踩。
+      验证方式：新增的跨盘用例**撤掉修复后应变红**（先 `git diff` 确认回退生效）。
+
 - [ ] **AW-3 修分类 `folder` 字段的路径越界（数据安全）**
       问题：`file_manager.py:30-33` 直接 `os.path.join(storage_root, folder)`，
       `folder` 来自用户自由文本（`dashboard.py:1093-1095`/`1112`/`1125`），
