@@ -381,7 +381,7 @@
       全程未 import GUI 模块（`dashboard.py` / `desktop_panel.py` 仅 `py_compile` 静态检查）、
       未在真实桌面验证，仓库根目录未生成 `config.json`（`git status` 仅 4 个预期改动文件）。
 
-- [ ] **AW-3 修分类 `folder` 字段的路径越界（数据安全）**
+- [x] **AW-3 修分类 `folder` 字段的路径越界（数据安全）**
       问题：`file_manager.py:30-33` 直接 `os.path.join(storage_root, folder)`，
       `folder` 来自用户自由文本（`dashboard.py:1093-1095`/`1112`/`1125`），
       填 `..\..\x` 就能把文件移出存储根目录。
@@ -389,6 +389,30 @@
       越界则拒绝并返回明确错误（不要静默 fallback 到别处）。
       新增用例：`folder` 为 `..\..\evil` / 绝对路径 / 含 `..` 的嵌套路径 → 断言被拒绝；
       正常的 `folder` → 断言仍正常解析。
+      ✅ 已完成（2026-10-17）：实际 **126** 个用例（110 → 126，净增 16 条，全在
+      `tests/test_file_manager.py` 新增 `TestCategoryFolderSafety`），
+      `python -m unittest discover -s tests -v` 全绿。
+      修法：新增模块级 `UnsafeCategoryFolder(ValueError)` + **纯函数**
+      `category_folder_error(storage_root, folder_name)`（返回 None 或一句中文错误说明），
+      `get_category_folder` 调它做校验，越界即 `raise UnsafeCategoryFolder`——
+      **明确报错，绝不静默兜底**（兜底会把「配置有问题」藏起来、继续把文件搬到错位置）。
+      校验规则（跨平台一致，`\` 与 `/` 都当分隔符，故 `..\..\evil` 在 POSIX 上也会被拒）：
+      非空 → 非绝对路径（不以分隔符开头、无盘符）→ 不含任何 `..` 组件（哪怕绕回存储根内
+      也不放行）→ 兜底用 `os.path.commonpath` 确认解析结果**严格**落在存储根内
+      （等于存储根本身也算越界）。
+      GUI 校验：`dashboard.py._on_add_category` 在保存前调同一个纯函数
+      `category_folder_error(get_storage_root(self.config), folder or name)`，
+      不合法则弹窗拦截。`panel_manager.add_category` 只由这条已校验的路径调用，无需重复校验。
+      ⚠️ `dashboard.py` 是 GUI 模块，**未 import**，只做 `py_compile` 静态检查
+      （`dashboard.py`/`desktop_panel.py`/`panel_manager.py`/`main.py` 均通过）。
+      反向验证（**定点**，未用 `git checkout origin/master -- <文件>` 那种超集回退）：
+      只把 `get_category_folder` 里的 `error = category_folder_error(root, folder_name)`
+      改成 `error = None  # BREAK`（跳过越界校验、恢复旧的裸 join 行为），
+      `git diff -- file_manager.py` 确认 `BREAK` 标记已生效（`grep BREAK` 命中）
+      → 重跑得 **11 failed**，全部是 `TestCategoryFolderSafety` 的越界拒绝用例；
+      装回修复、`grep BREAK` 0 命中后恢复 126 全绿。
+      全程 `tempfile.TemporaryDirectory()` 造目录、config 字典指向临时路径，
+      未在真实桌面验证，仓库根目录未生成 `config.json`（`git status` 仅 3 个预期改动文件）。
 
 - [ ] **AW-4 修 `move_into_category` 允许移入存储根祖先（数据安全）**
       问题：`file_manager.py:153-159` 只拒绝「分类文件夹本身」和「存储根」，
