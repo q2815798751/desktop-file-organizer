@@ -1263,3 +1263,126 @@
 队列清空（全部 `[x]` 或 `BLOCKED`）后，**停下来**，在文件末尾写一节
 「## 作业总结」：逐条列出完成了什么、验证结果（用例数）、`BLOCKED` 项及原因、待确认项，
 然后向用户报告。**不要自己发明新条目继续做。**
+
+## 作业总结
+
+> 收尾时间 2026-10-17，分支 `autowork/2026-10-16`。队列已清空：
+> **22 个条目全部完成，0 个 BLOCKED**。最终用例数 **284**
+> （`python -m unittest discover -s tests -v` 全绿）。
+
+### 完成了什么（按条目编号）
+
+- **AW-0** 建测试基建（标准库 `unittest`，`tests/`）：**36** 用例。反向验证：把
+  `_resolve_conflict` 的重命名模板加一个空格 → **6 红**。**独立 agent 对抗性复查「够格」**
+  （36 真绿、4 种逻辑破坏分别让 6/1/1/1 用例变红、插桩 361 次写操作 0 次落真实家目录、`master` 未动）。
+- **AW-1** 修 `save_config` 非原子写 + `load_config` 静默回退（原子写 + 损坏备份 + 保留 `initialized`）：**52**（+16）。
+  反向验证：撤掉修复 → **5 红**（原子写 1 + 损坏备份 2 + 保留 initialized 1 + 端到端二次搬移 1）。**有 AW-1 复查。**
+- **AW-2** 修 `_resolve_conflict` 的 TOCTOU + `shutil.move` 静默失败（`_move_no_clobber` 原子占位、`MoveResult`/`MoveStats`）：**80**（+28）。
+  反向验证：整块回退 → **12 红**；只退原子占位 → **2 红**（断言 `'NEW' != 'RACER'`）。**有 AW-2 复查**（确认 TOCTOU 真关掉）。
+- **AW-3** 修分类 `folder` 字段路径越界（`UnsafeCategoryFolder` + `category_folder_error`）：**126**（+16）。
+  反向验证：跳过越界校验 → **11 红**。**有 AW-3 复查。**
+- **AW-4** 修 `move_into_category` 允许移入存储根祖先（`storage_ancestor_error`）：**153**（+12）。
+  反向验证：两步定点 → **4 红 / 6 红**。**有 AW-4 复查**（确认大小写/分隔符不能绕过）。
+- **AW-5** 修回收站删除标志位与结果判定（`build_delete_flags` / `interpret_delete_result`）：**165**（+12）。
+  反向验证：标志位 → **3 红**；结果判定 → **4 红**。
+- **AW-6** 修 `restore_files.py` 硬编码路径与分类清单（配置驱动 + 纯函数 `build_restore_plan`）：**187**（+22）。
+  反向验证：desktop 写死 → **5 红**；分类写死 → **3 红**。**有 AW-6 复查。**
+- **AW-7** 修文件监控搬走「半成品」（`is_stable` / `stable_files` / `stability_decision`）：**225**（+22）。
+  反向验证：`is_stable` 恒真 → **6 红**；`stable_files` 无条件稳定 → **3 红**。
+- **AW-8** 把静默吞掉的异常改成可观测（标准库 `logging` WARNING）：**234**（+9）。反向验证：四组破坏 → **2/1/2/2 红**。
+- **AW-9** 修搜索时 `getsize` 崩溃（`safe_size` 返回占位 `—`）：**242**（+8）。反向验证：去掉 `try/except` → **8 error**。
+- **AW-10** 修 `config.py` 浅拷贝污染 `DEFAULT_CONFIG`（改 `copy.deepcopy`）：**246**（+4）。反向验证：改回浅拷贝 → **4 红**。
+- **AW-11** 新建/编辑分类时校验扩展名重叠（`extension_conflicts` / `extension_conflict_error`）：**265**（+19）。
+  反向验证：判据恒假 → **10 红 + 1 error**。
+- **AW-12** `requirements.txt` 与文档不一致（`pywin32` 标可选、README 快捷方式说法更正）：**270**（+5）。
+  反向验证：两步 → **各 1 红**；另 `pip install --dry-run -r requirements.txt` exit 0（只读，未重装环境）。
+- **AW-13** 桌面图标自动重排加配置开关 `arrange_icons`（**默认 `true`**，不改现有行为）：**280**（+10）。
+  反向验证：两步 → **各 2 红**。
+- **AW-14** 加 CI（`.github/workflows/tests.yml`，`windows-latest`）：**280**。CI 实跑确认 **success**。
+- **AW-15** 加固「配置损坏」的回退方向（区分「文件不存在」vs「读不出」，删除会骗人的 `_salvage_initialized`）：**91**（+11）。
+  反向验证：撤掉修复 → **11 红**（3 条端到端**实测复现**二次搬移，非推断）。
+- **AW-16** 补跨盘分支测试覆盖 + 清掉半拷贝残留（`_cleanup_partial` + `PartialMoveError`）：**98**（+7）。
+  反向验证：整块回退 → **3 红**；废掉 copytree 分支 → **4 红**。**有 AW-16 复查。**
+- **AW-17** 给 `_cleanup_partial` 加所有权校验 + 拖拽路径上报 residual：**102**（+4）。
+  反向验证：改回无条件 `rmtree(dest)` → **2 红**（断言「用户目录被误删了！」）。**有 AW-17 复查。**
+- **AW-18** 修 `(None, None)` 被当成功（新增纯函数 `did_move`）+ 清过时 docstring：**110**（+8）。
+  反向验证：`did_move` 改回 `bool(result)` → **3 红**。
+- **AW-19** 处置 `UnsafeCategoryFolder` 回归（四入口改 `safe_category_folder` 可见降级）+ junction 逃逸（`realpath_escape_error`）：**141**（+15）。
+  反向验证：三步定点 → **9 error / 1 红 / 1 红+2 error**（含真实 `mklink /J` 用例，实跑非 skip）。
+- **AW-20** 补 AW-4 复查点名的覆盖缺口 + 更正被夸大的危害表述：**284**（+4）。反向验证：两步定点 → **2 红 / 1 红**。
+- **AW-21** `restore_files` 补 junction 复检（复用 `realpath_escape_error`）+ 修测试「安全承诺」假象（setUp 护栏断言）：**203**（+16）。
+  反向验证：四组定点 → **3 / 38 / 1 / 5 红**。
+
+> **verifier 复查情况**：AW-0 / AW-1 / AW-2 / AW-3 / AW-4 / AW-6 / AW-16 / AW-17 都有**独立 agent 的对抗性复查**
+> 记录（复查结论与实测见各自条目末尾，也见「已做过的对抗性复查」一节）；其中若干复查**实测推翻或补充了**
+> 原条目的假设（如 AW-4 的危害被证伪、AW-6 的测试安全承诺被证伪）。AW-18 直接源于 AW-17 复查、AW-20 源于 AW-4 复查、
+> AW-21 源于 AW-6 复查。其余条目靠**定点破坏反向验证**（先确认回退生效、再确认对应用例变红）自证。
+
+### 验证结果
+
+- **最终用例数：284**。本机 `python -m unittest discover -s tests -v` **全绿**（**无 skip**）。
+- **CI**：`.github/workflows/tests.yml`，runner **`windows-latest`**（CPython 3.14）。
+  最后一次运行 **run `39014635179`（#6，head `20f7f70`，即 AW-20 收尾提交）→ 结论 `success`**，
+  日志 `Ran 284 tests in 1.142s` / `OK (skipped=1)`。
+  那 1 条 skip 是设备名用例（`con`）——CI 的 Windows Server 2025 **不把带绝对路径前缀的保留设备名
+  解析成设备路径**，属**环境差异、非代码退化**；本机 Windows 10 上该用例**照常实跑**。
+  （历史：AW-14 首次加 CI 时同一 workflow 曾两次 failure，第三次修好后 success，见 AW-14 条目。）
+- 每个条目都做了**定点破坏反向验证**：先把修复改回旧行为、用 `git diff`/`grep BREAK` 确认回退**真的生效**，
+  再确认对应用例变红（有的还在旧行为上实测复现了数据丢失/二次搬移），然后装回恢复全绿——不是前后都绿的摆设。
+
+### BLOCKED 项
+
+**无。** 22 个条目全部完成，没有一条触发「同一项连续失败两次」的 BLOCKED 条件。
+
+### 待确认项（留给用户拍板，共 6 条）
+
+1. **编辑分类时要不要同步改磁盘上的文件夹名？** 现在 `dashboard.py` 编辑分类只改 `name`/`extensions`、
+   不改 `folder`，界面名与磁盘目录名会长期不一致；真去改目录名要移动里面所有文件，风险大、需要迁移逻辑。属产品决策。
+2. **首次运行静默搬桌面文件要不要改成默认不搬？** 目前首次启动无确认就搬走匹配文件（AW-2 已让失败不再静默，但「默认搬不搬」未定）。
+3. **`arrange_icons` 的默认值**：AW-13 按「保持 `true` 不改变现状」处理；若你想默认关掉，说一声。
+4. **要不要引入 pytest？** 我选了标准库 `unittest`（零新依赖，符合仓库风格）；更想用 pytest 的话 AW-0 要重写。
+5. **`requirements.txt` 要不要硬加 `pywin32`？** AW-12 已拍板「可选依赖 + 说明」（`# pywin32>=306` 注释掉）。
+   想要硬依赖：取消注释该行 + 把 README「环境要求」里的「可选」措辞同步改掉（一行改动）。
+6. **AW-11 扩展名重叠：拦截保存 vs. 允许「明确覆盖」？** 现选**直接拦截保存**（弹窗提示后 return，与 AW-3 的
+   folder 校验一致）。若想保留「高级用户强行声明重叠、按分类顺序路由」，改成二次确认即可（纯函数无需改，只改 GUI 拦截方式）。
+
+### 本机需要额外动作的事项
+
+- **没有需要重新打包的 exe**：这是 Python GUI，从源码 `python main.py` 运行；本轮改动**全在源码（`.py`）与文档**，
+  **不需要重跑安装器、也不需要重新生成 `config.json`**——下次从源码启动即生效。
+  - ⚠️ 但仓库 `dist/` 下有两个 **2026-09-08 构建的旧 exe**（`DesktopFileOrganizer.exe` / `DesktopFileOrganizer-安装程序.exe`，
+    均被 `.gitignore` 忽略、**本轮未重建**）。它们**不含**本轮任何修复；若你靠打包产物分发，需要**重新构建**（本轮未做，按作业要求也不做）。
+- **`config.json` 无需重新生成**：它是 `.gitignore` 的本机文件、首次运行自动生成。AW-13 新增的 `arrange_icons` 键由
+  `load_config` **向后兼容地补默认值 `true`**，老配置无需手动改。
+- **`config.example.json` 未同步 `arrange_icons`**（仍缺该键）：不影响运行（`load_config` 会补默认值），
+  仅属示例文件与默认配置的轻微不一致，是否补由你决定。
+- **`pywin32` 仍为可选**：不装则开机自启走 `.bat` 降级路径（功能可用，登录时会闪一下控制台窗口）；想要 `.lnk` 就取消注释安装。
+- **改了哪些行为（便于你验证）**：
+  - 配置损坏时：**不再二次搬移**桌面，损坏文件备份成 `config.json.corrupt-<时间戳>`。
+  - 分类目录名不安全（`..`/绝对路径/junction 逃逸）：**可见降级**（启动弹窗 + ERROR 日志 + 跳过该分类），不再崩溃、也不再静默写到根外。
+  - 移动文件失败：不再静默吞掉，改为记 WARNING 日志（首次整理 / 归类 / 拖拽路径均如此）。
+  - `restore_files.py`：改为**配置驱动**（认自建分类与配置里的 `desktop_path`），并补了 junction 复检。
+  - 桌面图标自动重排：新增 `arrange_icons` 开关，**默认仍为开**（对现有用户行为不变）。
+  - 回收站删除：修正确认框标志位；用户点「取消」不再被计为删除成功。
+  - 桌面文件「写一半」时不再被搬走（稳定性采样；最长重试 20 次后放弃自动归类、留在桌面）。
+  - 新建/编辑分类：越界 `folder`、重名、扩展名重叠都会被拦截保存。
+
+### 验证基建现状
+
+- **4 个测试文件**：`tests/test_config.py`、`tests/test_file_manager.py`、`tests/test_init_folders.py`、
+  `tests/test_restore_files.py`，共 **284** 用例，入口 `python -m unittest discover -s tests -v`（零新依赖，标准库 `unittest`）。
+- **能覆盖什么**：`file_manager.py` 的纯逻辑与移动/冲突消解/越界/稳定性判定、`config.py` 的读写/损坏回退/默认隔离、
+  `init_folders` 的首次搬移与降级、`restore_files.py` 的恢复计划与 junction 复检。安全关键路径
+  （no-clobber 原子占位、所有权校验、junction 逃逸）都有**真实文件系统**（含真实 `mklink /J`）或**定点破坏**锁定的用例。
+- **仍是零覆盖的区域（如实，不夸大）**：
+  - **GUI 模块** `dashboard.py` / `desktop_panel.py` / `panel_manager.py` / `main.py`：**未 import**，只做 `py_compile`
+    语法静态检查——UI 交互、拖拽接线、弹窗逻辑**没有行为测试**。
+  - **`file_watcher.py`**：其 `_process_pending` 的防抖/重试逻辑**未直接测试**（只测了抽出来的纯函数
+    `is_stable` / `stable_files` / `stability_decision`）；watcher 本体只 `py_compile`。
+  - **真实 `ctypes.windll` 调用**（`SHFileOperation` 回收站删除、`LVM_ARRANGE` 桌面重排）：**从不执行**（会真删/真动），
+    只测抽出来的纯函数与打桩的窄接口。
+  - `icons.py`、`themes.py`、`setup.py`、`installer/` 及打包流程：**无测试**。
+  - **真实桌面 / 真实存储目录从未被验证**（红线要求）：所有用例都在 `tempfile.TemporaryDirectory()` 内、
+    `config.CONFIG_PATH` 打桩到临时路径。
+
+> 队列已空，按「收尾」要求停止。**不再新增条目、不再做代码改动。**
