@@ -1083,7 +1083,7 @@
       仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在；
       `git status` 仅 6 个预期改动文件）。
 
-- [ ] **AW-14 加 CI（打磨）**
+- [x] **AW-14 加 CI（打磨）**
       问题：仓库没有 `.github/workflows/`，改动没有任何自动把关。
       修法：加一个 GitHub Actions workflow，在 push 时跑
       `python -m unittest discover -s tests -v`。
@@ -1094,6 +1094,63 @@
       验证方式：本地先用同样命令跑通，再 push，**然后确认 Actions 这次运行的结果**
       （用 `git credential fill` 取 token 调 GitHub API 查 workflow run 状态；
       查不到就如实说明「已推送但未能确认 CI 结果」，不要假装绿了）。
+      ✅ 已完成（2026-10-17）：`.github/workflows/tests.yml` 已加，CI **实跑并确认绿**
+      （run `39013706751`，`conclusion=success`）。用例数不变（**280**，命令仍是
+      `python -m unittest discover -s tests -v`；CI 上 280 中 **1 skipped**，见下）。
+      - **workflow 内容**：`on: push / pull_request / workflow_dispatch`；job `unittest`
+        四步——(1) `actions/checkout@v4`；(2) `actions/setup-python@v5` +
+        `python-version: "3.14"`；(3) `python -m unittest discover -s tests -v`；
+        (4) `python -m py_compile main.py dashboard.py desktop_panel.py panel_manager.py
+        file_watcher.py`——测试不 import GUI 模块（PyQt5 依赖），这几支只有语法静态检查，
+        让它们的语法错误也能在 CI 里暴露。**零依赖**：套件只用标准库 unittest，
+        `file_manager` / `config` / `restore_files` 都不 import PyQt5，故**没有 `pip install`**，
+        也没有 pytest（符合规则 9）。
+      - **runner 选 `windows-latest` 而不是 `ubuntu-latest`**——理由三条：
+        (1) **没有桌面环境不是问题**：`import file_manager` **不会**拉起 PyQt5
+        （`file_manager.py` / `config.py` / `restore_files.py` 只 import 标准库；
+        `ctypes.windll` 只在函数体内用，模块级只有 `from ctypes import wintypes`，
+        而该模块在 POSIX 上也可 import——无平台守卫）。
+        (2) **真正卡住 Ubuntu 的是若干用例断言的 Windows 路径语义**（不是桌面环境）：
+        `test_file_manager…test_rejects_absolute_windows_path` 依赖
+        `os.path.isabs("C:\\Windows\\evil") is True`（posixpath 上是 False →
+        该 folder 不被判越界、`assertRejected` 失败）；`test_restore_files.TestCategoryDir`
+        的两条依赖 `abspath("con")=="\\.\con"` 与 `D:evil` 的盘符语义（POSIX 无盘符）。
+        实测：用 `posixpath` 直接复算这三条的被测判据，确认在 Linux 上会红
+        （另把全套在「POSIX 语义 rename」下重跑，280 仍 OK——说明卡住的**不是**
+        rename 语义，而是这几条路径语义）。
+        (3) **junction 用例在 Ubuntu 上会被静默跳过**（`skipUnless(os.name=="nt")`），
+        那是 AW-19/AW-21 的核心安全覆盖，不该丢。
+      - **CI 实跑记录（同一 workflow 共 3 次）**：
+        1. `4bc7f4d` → **failure**：`test_reserved_device_name_hits_valueerror_branch`
+           1 红，断言输出 `'...\\storage\\con' is not None`。
+        2. `dfa0103` → **failure**：同一条仍红（第一版修法没生效，见下）。
+        3. `26d0da2` → **success** ✅：日志 `Ran 280 tests in 0.990s` / `OK (skipped=1)`，
+           五个 step 全 success。runner 镜像 `windows-2025-vs2026` + CPython **3.14.8**
+           （本机是 Windows 10 + 3.14.7）。
+      - **CI 抓到的真实问题（加 CI 的直接收益）**：该用例断言
+        `os.path.abspath("<root>\\con")` 会变成设备路径 `\\.\con` → `commonpath` 抛
+        `ValueError`（AW-21 加的 `except ValueError` 分支的覆盖来源）。
+        **这是 Windows 版本相关行为**：本机 Windows 10 两种形态（纯名字 `"con"` 与
+        「绝对路径 + con」）**都**映射；CI 的 Windows Server 2025 **只映射纯名字**，
+        带绝对路径前缀时返回普通路径 → `_category_dir` 返回 `<root>\con`
+        （**仍落在存储根内，AW-21 的安全承诺没破**，只是这条用例覆盖的
+        `except ValueError` 分支在该环境不存在）。
+        第一版修法（import 期常量探测 `abspath("con")`）**在 runner 上仍为真、没跳过**
+        （第 2 次 CI 实测仍 failure），故改成**运行时**探测、且用**与被测代码完全相同的
+        路径构造** `os.path.abspath(os.path.join(os.path.abspath(self.root), "con"))`，
+        不是设备路径就 `self.skipTest`。
+        **没有**把断言改成对任何环境恒真（那等于没测），也**没有**改生产代码——
+        这是环境差异、不是代码退化，且坏配置下 `_category_dir` 的返回值仍受
+        「必须落在存储根内」这条承诺约束。
+        本地该用例照常**实跑**（本机 probe 命中）；另用「模拟 runner」的探针
+        （纯名字仍映射、绝对路径不映射）确认它会**正确 skip**。
+      - 验证方式：本地 `python -m unittest discover -s tests -v` → **280 全绿**；
+        `python -m py_compile` 五个 GUI 模块 exit 0；push 后用 `git credential fill`
+        取 token 调 GitHub Actions API 确认第 3 次运行 **success**（run 与日志摘要已列，
+        **不是**「未能确认」）。
+      - 全程 `tempfile.TemporaryDirectory()` + `mock.patch("config.CONFIG_PATH", 临时路径)`；
+        未运行 `main.py` / `restore_files.py`，未在真实桌面验证，
+        仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在）。
 
 - [ ] **AW-20 补 AW-4 复查点名的覆盖缺口 + 更正被夸大的危害表述（测试基建 + 文档诚实性）**
 
