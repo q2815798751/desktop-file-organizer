@@ -1,0 +1,49 @@
+name: tests
+
+# AW-14：给仓库加最小的自动把关——push / PR 时跑标准库 unittest 套件。
+#
+# 为什么 runner 用 windows-latest（而不是 ubuntu-latest）：
+#   本项目是 Windows 专用 GUI（`file_manager.py` 大量 `ctypes.windll`），
+#   但测试只覆盖纯逻辑、**不 import PyQt5**，所以「有没有桌面环境」不是问题。
+#   真正的问题是若干用例断言的是 **Windows 的路径语义**，在 POSIX 上必然不成立：
+#     - test_file_manager … test_rejects_absolute_windows_path
+#         依赖 `os.path.isabs("C:\\Windows\\evil") is True`（posixpath 上是 False），
+#         于是该 folder 在 Linux 上不会被判越界 → assertRejected 失败。
+#     - test_restore_files.TestCategoryDir.test_reserved_device_name_hits_valueerror_branch
+#         依赖 `os.path.abspath("con") == "\\\\.\\con"` → commonpath 抛 ValueError；
+#         Linux 上 abspath 是 `<cwd>/con`，不抛 ValueError → 该分类不被跳过 → 失败。
+#     - test_restore_files.TestCategoryDir.test_drive_relative_path_hits_valueerror_branch
+#         依赖 `D:evil` 的盘符语义（POSIX 无盘符）→ 同上失败。
+#   另外 junction / 符号链接用例（真实 `mklink /J`，是安全相关的实质覆盖）
+#   都带 `skipUnless(os.name == "nt")`，在 ubuntu 上会被**静默跳过**、覆盖面缩水。
+#   综上：windows-latest 才能既跑绿又保留全部实质覆盖，且与开发环境（Python 3.14 / Windows）一致。
+#
+# 依赖：**零**。套件只用标准库 `unittest`；`file_manager` / `config` /
+# `restore_files` 都不 import PyQt5，故不需要 `pip install`（见 AUTOWORK 规则 9）。
+# 不引入 pytest。
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unittest:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      # 测试不 import GUI 模块（PyQt5 依赖），这几支只做语法静态检查，
+      # 让 dashboard.py / main.py 之类的语法错误也能在 CI 里暴露。
+      - name: Byte-compile GUI modules (not imported by tests)
+        run: >-
+          python -m py_compile
+          main.py dashboard.py desktop_panel.py panel_manager.py file_watcher.py
