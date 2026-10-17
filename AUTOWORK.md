@@ -729,13 +729,53 @@
       的 `__main__` 入口，未在真实桌面验证，仓库根目录未生成 `config.json`
       （`ls config.json` 显式确认不存在；`git status` 仅 2 个预期改动文件）。
 
-- [ ] **AW-7 修文件监控搬走「半成品」（健壮性，但有真实数据风险）**
+- [x] **AW-7 修文件监控搬走「半成品」（健壮性，但有真实数据风险）**
       问题：`file_watcher.py:32,66-85` 防抖只有 500ms 且**不判断文件是否写完**，
       大文件正在复制时会被 `categorize_file`（`file_manager.py:86`）移走半个文件。
       修法：归类前检查文件稳定性——间隔采样 `os.path.getsize`，连续两次相同（或 mtime 稳定）
       才归类；不稳定则稍后重试。
       新增用例：把「稳定性判断」抽成纯函数（例如 `is_stable(path, ...)`，可注入 sizes 序列），
       断言「大小仍在变 → 判为不稳定」「两次相同 → 稳定」。真实文件系统行为用临时文件补一条集成用例。
+      ✅ 已完成（2026-10-17）：实际 **225** 个用例（203 → 225，净增 22 条，全在
+      `tests/test_file_manager.py`：`TestIsStable` 8 条 + `TestStableFilesIntegration` 8 条 +
+      `TestStabilityDecision` 6 条），`python -m unittest discover -s tests -v` 全绿。
+      - **怎么让它可验证（沿用 AW-5/AW-18 的套路：纯逻辑放可 import 的 `file_manager.py`，
+        不 import GUI/`file_watcher`）**：新增三个窄接口——
+        `is_stable(sizes, min_samples=2)`（**纯函数**：注入 sizes 序列，最后两个相等即稳定）；
+        `stable_files(paths, getsize=None, interval=0.5, sleep=time.sleep)`
+        （只读文件系统：整批间隔采样 `os.path.getsize`，返回 `(stable, unstable)`，
+        依赖全部可注入）；`stability_decision(stable, retries, max_retries)`
+        （**纯函数**：重试策略 → `categorize` / `retry` / `give_up`）。
+      - **判定规则**：间隔采样大小，**连续两次相同 → 稳定（写完）**；仍在变 → 不稳定；
+        样本不足 / 读不到大小（已删、权限、采样途中消失）→ 一律判**不稳定**（宁可晚点再试，
+        也不在读不到大小时冒险搬走半成品）。
+      - **`file_watcher._process_pending` 怎么改**：先剔除已消失的文件；对剩余待处理文件
+        调 `stable_files`；`still_writing` 的按 `stability_decision` 记一次重试并放回 `_pending`
+        （下个防抖周期再看），超过 `_max_retries=20` 则**放弃自动归类、把文件留在桌面**
+        并记 WARNING（安全优先，绝不搬半成品）；`ready` 的才 `categorize_file`。
+      - ⚠️ **为什么不逐文件 sleep**：`_process_pending` 是 QTimer 槽、跑在 GUI 线程，
+        逐文件 sleep 会让一批 N 个文件卡住 `N × interval` 秒；`stable_files` 改成
+        **整批共享一次等待**（用例 `test_batch_shares_single_wait` 钉住「只 sleep 一次」）。
+      - 真实文件系统集成用例：真实 `os.path.getsize` + 临时文件——
+        「不再改动 → 稳定」「注入假 sleep 在等待期间向真实文件追加内容 → 不稳定」
+        「文件在采样期间被删 → 不稳定」「一批里只增长的那个被划为不稳定」。
+      反向验证（**两步定点破坏**，未用 `git checkout origin/master -- <文件>` 那种超集回退；
+      每步先 `git diff` 确认 `BREAK` 标记生效）：
+      (A) 把 `is_stable` 的 `return sizes[-1] == sizes[-2]` 改成 `return True`（假装永远稳定）
+          → 重跑得 **6 failed**，正是「仍在变 → 不稳定」的用例
+          （`TestIsStable` 的 `test_growing_size_is_unstable` / `test_shrinking_size_is_unstable`
+          / `test_only_last_two_samples_decide` + `TestStableFilesIntegration` 的
+          `test_file_growing_between_samples_is_unstable` / `test_batch_partitioned_by_growth`
+          / `test_injected_getsize_sequence`）；
+      (B) 把 `stable_files` 的第二次采样比较改回「无条件判稳定」→ 重跑得 **3 failed**，
+          正是 `TestStableFilesIntegration` 的
+          `test_file_growing_between_samples_is_unstable` / `test_batch_partitioned_by_growth`
+          / `test_injected_getsize_sequence`（证明集成用例真的在压文件系统采样分支）。
+      装回后 `grep BREAK` 0 命中、恢复 225 全绿。
+      全程 `tempfile.TemporaryDirectory()` 造目录、无真实目录写操作；未 import GUI/`file_watcher`
+      （`file_watcher.py` 只做 `py_compile` 静态检查，未运行 `main.py` / `restore_files.py`），
+      未在真实桌面验证，仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在；
+      `git status` 仅 3 个预期改动文件）。
 
 - [ ] **AW-8 把静默吞掉的异常改成可观测（健壮性）**
       问题：`file_manager.py:130`（批量移动失败 `pass`）、`file_manager.py:234`
