@@ -336,11 +336,13 @@ class TestMoveIntoCategory(TempDirsMixin, unittest.TestCase):
         self.assertFalse(os.path.exists(src_dir))
 
     def test_name_conflict_renames_on_move(self):
-        self.write_file(os.path.join(self.storage, "图片", "a.png"), "old")
+        existing = self.write_file(os.path.join(self.storage, "图片", "a.png"), "old")
         src = self.write_file(os.path.join(self.desktop, "a.png"), "new")
         name, dest = file_manager.move_into_category(self.cfg, self.pics, src)
         self.assertEqual(name, "a(1).png")
         self.assertEqual(os.path.basename(dest), "a(1).png")
+        self.assertEqual(self.read_file(existing), "old", "已存在的同名文件不得被覆盖")
+        self.assertEqual(self.read_file(dest), "new")
 
     def test_returns_none_and_keeps_source_when_move_fails(self):
         src = self.write_file(os.path.join(self.desktop, "a.png"), "keep")

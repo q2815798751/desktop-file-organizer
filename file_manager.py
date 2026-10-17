@@ -1,14 +1,26 @@
 """
 文件管理模块 — 文件分类、移动、列出。
 """
+import errno
 import os
 import shutil
 import ctypes
+from collections import namedtuple
 from ctypes import wintypes
 from datetime import datetime
 
 # 分类文件夹的默认存储位置：Documents\桌面文件收纳（不在桌面，保持桌面整洁）
 DEFAULT_STORAGE_NAME = "桌面文件收纳"
+
+# 一次搬移的结果（结构化：成功/失败 + 原因），替代「失败时静默返回 None」。
+MoveResult = namedtuple("MoveResult", ["ok", "path", "error"])
+
+# 一批搬移的统计（成功数 / 失败数 / 失败原因列表），供 init_folders 汇总上报。
+MoveStats = namedtuple("MoveStats", ["moved", "failed", "errors"])
+
+# 竞态下换名重试上限：_resolve_conflict 已保证正常情况不冲突，
+# 这里只兜底「解析出目标名之后、原子占用之前被别的进程抢占」的极窄窗口。
+_CONFLICT_RETRIES = 100
 
 
 def get_desktop_path(config):
@@ -39,9 +51,16 @@ def init_folders(config):
     1. 确保所有分类子文件夹存在（每次启动都执行）
     2. 仅首次运行时把桌面上已有的匹配文件移入对应文件夹
        （用 config 里的 initialized 标记，避免每次启动都静默移动文件）
+
+    返回 MoveStats(moved, failed, errors)：首次运行搬移的统计。
+    搬移失败不再被静默吞掉，调用方可以据此提示用户。
     """
     desktop = get_desktop_path(config)
     first_run = not config.get("initialized", False)
+
+    moved = 0
+    failed = 0
+    errors = []
 
     for cat in config["categories"]:
         folder = get_category_folder(config, cat)
@@ -49,14 +68,17 @@ def init_folders(config):
 
         if first_run:
             extensions = cat.get("extensions", [])
-            _move_matching_files(desktop, folder, extensions)
+            stats = _move_matching_files(desktop, folder, extensions)
+            moved += stats.moved
+            failed += stats.failed
+            errors.extend(stats.errors)
 
     if first_run:
         config["initialized"] = True
         from config import save_config
         save_config(config)
 
-    return 0
+    return MoveStats(moved, failed, errors)
 
 
 def categorize_file(file_path, config):
@@ -81,12 +103,10 @@ def categorize_file(file_path, config):
             folder = get_category_folder(config, cat)
             os.makedirs(folder, exist_ok=True)
 
-            dest = _resolve_conflict(folder, os.path.basename(file_path))
-            try:
-                shutil.move(file_path, dest)
-                return cat["name"], dest
-            except (OSError, shutil.Error):
-                return None, None
+            result = _move_no_clobber(file_path, folder, os.path.basename(file_path))
+            if result.ok:
+                return cat["name"], result.path
+            return None, None
 
     return None, None
 
@@ -116,18 +136,36 @@ def get_files_in_category(config, category):
 
 
 def _move_matching_files(source_dir, target_dir, extensions):
-    """将源目录中匹配扩展名的文件移动到目标目录。"""
-    for entry in os.listdir(source_dir):
+    """
+    将源目录中匹配扩展名的文件移动到目标目录。
+
+    返回 MoveStats(moved, failed, errors)：搬移失败不再被静默吞掉，
+    调用方（init_folders 等）据此统计失败数。
+    """
+    moved = 0
+    errors = []
+
+    try:
+        entries = os.listdir(source_dir)
+    except OSError as e:
+        return MoveStats(0, 0, [e])
+
+    os.makedirs(target_dir, exist_ok=True)
+    wanted = [e.lower().lstrip(".") for e in extensions]
+
+    for entry in entries:
         full = os.path.join(source_dir, entry)
         if not os.path.isfile(full):
             continue
         ext = os.path.splitext(entry)[1].lower().lstrip(".")
-        if ext in [e.lower().lstrip(".") for e in extensions]:
-            dest = _resolve_conflict(target_dir, entry)
-            try:
-                shutil.move(full, dest)
-            except (OSError, shutil.Error):
-                pass
+        if ext in wanted:
+            result = _move_no_clobber(full, target_dir, entry)
+            if result.ok:
+                moved += 1
+            else:
+                errors.append(result.error)
+
+    return MoveStats(moved, len(errors), errors)
 
 
 def move_into_category(config, category, src_path):
@@ -159,16 +197,21 @@ def move_into_category(config, category, src_path):
         return None, None
 
     os.makedirs(folder, exist_ok=True)
-    dest = _resolve_conflict(folder, os.path.basename(src_path))
-    try:
-        shutil.move(src_path, dest)
-        return os.path.basename(dest), dest
-    except (OSError, shutil.Error):
-        return None, None
+    result = _move_no_clobber(src_path, folder, os.path.basename(src_path))
+    if result.ok:
+        return os.path.basename(result.path), result.path
+    return None, None
 
 
 def _resolve_conflict(folder, filename):
-    """处理文件名冲突：文档.docx → 文档(1).docx"""
+    """
+    处理文件名冲突：文档.docx → 文档(1).docx
+
+    只负责**提议**一个当前不冲突的名字（纯函数，无副作用）。
+    真正的安全性由 _move_no_clobber 保证：它会在搬移前用
+    O_CREAT|O_EXCL / os.rename 原子地占用该路径，因此「提议」与
+    「落盘」之间即使被别的进程抢占，也不会覆盖别人的文件。
+    """
     dest = os.path.join(folder, filename)
     if not os.path.exists(dest):
         return dest
@@ -181,6 +224,84 @@ def _resolve_conflict(folder, filename):
         if not os.path.exists(new_dest):
             return new_dest
         counter += 1
+
+
+def _release_placeholder(dest, is_dir):
+    """撤掉未被使用的占位（仅当它还是空的），避免留下垃圾文件。"""
+    try:
+        if is_dir:
+            if not os.listdir(dest):
+                os.rmdir(dest)
+        elif os.path.getsize(dest) == 0:
+            os.remove(dest)
+    except OSError:
+        pass
+
+
+def _move_file_no_clobber(src, dest):
+    """
+    文件：先用 O_CREAT|O_EXCL 原子占位，再搬入占位处。
+    目标已被别人占用时抛 FileExistsError（交由上层换名重试），
+    因此绝不可能覆盖已存在的同名文件——这正是原来「先查存在再 move」
+    之间那条竞态窗口会造成的数据丢失。
+    """
+    fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    os.close(fd)
+    try:
+        shutil.move(src, dest)
+    except BaseException:
+        _release_placeholder(dest, is_dir=False)
+        raise
+
+
+def _move_dir_no_clobber(src, dest):
+    """
+    目录：os.rename 原子且不覆盖（目标已存在则 FileExistsError）。
+    跨盘符（EXDEV）时退回 copytree：它用 os.makedirs 原子占用目标名，
+    已存在同样抛 FileExistsError，因此不会覆盖或嵌套。
+    """
+    try:
+        os.rename(src, dest)
+        return
+    except FileExistsError:
+        raise
+    except OSError as e:
+        if getattr(e, "errno", None) != errno.EXDEV:
+            raise
+    # 跨盘符
+    shutil.copytree(src, dest)
+    shutil.rmtree(src)
+
+
+def _move_no_clobber(src, folder, filename):
+    """
+    把 src 移入 folder，自动消解重名冲突，返回 MoveResult(ok, path, error)。
+
+    与旧的「_resolve_conflict 之后直接 shutil.move」不同：
+    - 名字是**原子占用**的，杜绝 TOCTOU 竞态覆盖；
+    - 任何失败都以结构化结果返回（含原因），绝不静默吞掉。
+    """
+    is_dir = os.path.isdir(src)
+    last_error = None
+
+    for _ in range(_CONFLICT_RETRIES):
+        dest = _resolve_conflict(folder, filename)
+        try:
+            if is_dir:
+                _move_dir_no_clobber(src, dest)
+            else:
+                _move_file_no_clobber(src, dest)
+            return MoveResult(True, dest, None)
+        except FileExistsError as e:
+            # 竞态：目标在解析之后被别人抢占 → 换个名字重试
+            last_error = e
+            continue
+        except (OSError, shutil.Error) as e:
+            return MoveResult(False, None, e)
+
+    return MoveResult(
+        False, None, last_error or OSError("目标目录同名条目过多，无法消解冲突")
+    )
 
 
 # ── 桌面图标排列 ─────────────────────────────────────────
