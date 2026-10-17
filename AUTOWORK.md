@@ -625,6 +625,51 @@
       且全部路径打桩到临时目录），未在真实桌面验证，仓库根目录未生成 `config.json`
       （`ls config.json` 显式确认不存在；`git status` 仅 2 个预期改动文件）。
 
+- [ ] **AW-21 给 restore_files 补 junction 复检 + 修测试的「安全承诺」假象（AW-6 复查实测）**
+
+      AW-6 的对抗性复查确认「够格」（187 用例真绿、22 条真会红、无越界改动、
+      `restore()` 执行层**有**覆盖——`trace` 显示 138-150/154 行全命中，
+      所以「计划正确≠执行安全」的担心不成立），但实测出四件事，前两件必须处理：
+
+      **1. 🔴 junction / 符号链接逃逸（唯一的真洞，范围缺口非回归）。**
+      `restore_files.py` 的 `_category_dir` **没有 realpath 复检**——而 `file_manager` 里
+      AW-19 加的 `realpath_escape_error` 正是干这个的。实测：存储根里若有 `storage\evil`
+      是指向根外的 junction，`_category_dir` 会 ACCEPT → `build_restore_plan` 列出
+      `outside\SECRET.txt` → `restore()` 实际发出
+      `MOVE <根外>\SECRET.txt -> <桌面>\SECRET.txt`——**把根外的文件搬出来**。
+      前提是存储根里已被植入 junction（用户为省空间自己链的，或同步软件植入）。
+      旧代码硬编码分类名、没有这个面，所以是**范围缺口不是回归**。
+      修法：**复用 `file_manager.realpath_escape_error`**（现成的），越界即跳过该分类，
+      参考 `safe_category_folder` 的**可见降级**（记日志/让用户看到，别静默）。
+      新增用例：存储根里造 junction 指向根外 → 断言该分类被跳过、
+      **根外文件一个都没被搬**。
+
+      **2. 🔴 测试的「撤掉修复也不碰真实桌面」是假象，必须加固。**
+      复查实测：把修复撤掉后，spy 记录到
+      `MOVE <tmp>\REAL_STORAGE\图片\victim.png -> C:\Users\sechen\Desktop\victim.png`
+      ——**真实桌面**。原因两条：
+      (a) 旧代码的 `CONFIG_PATH` 是**模块级常量**，`mock.patch("config.CONFIG_PATH")`
+      对它**完全无效**；
+      (b) 旧代码的 `DESKTOP` 在 **import 时**绑定，而 `expanduser` 打桩在 `setUp` 才启动。
+      现在「看着安全」只因仓库根恰好没有 `config.json`——**是缺文件的巧合，不是护栏性质**。
+      修法（复查建议）：`setUp` 里**额外断言** `restore_files.resolve_desktop({})`
+      落在 `self.tmp` 内；或让打桩同时覆盖 `HOME`/`USERPROFILE`。
+      **并修掉 docstring 里那个不成立的安全承诺。**
+      > 教训：**「测试看起来保护了真实目录」不等于它真的保护了。**
+      > 打桩打在不生效的目标上（模块级常量、import 时绑定）是**静默失效**，
+      > 和「gitignore 让污染隐形」是同一类：检查动作发生了，
+      > 但检查的**不是你以为的东西**。
+
+      **3. 去重按原始字符串，等价拼写会重复（低危）。** `shared` vs `.\shared`
+      不去重 → 计划里同源文件出现两次 → 第二条报 `[WinError 2]`。
+      **不丢数据、不重复恢复**，但计划不自洽、多一行失败日志。改成按 `os.path.abspath` 去重。
+
+      **4. 补测三处未覆盖的失败分支**（复查用 `trace` 查出）：
+      `except OSError`（151-152）、第二次改名冲突（133）、
+      `except ValueError`（88-89，真实触发路径是保留设备名如 `con`/`D:evil`——目前**零覆盖**）。
+      顺手修 `resolve_desktop` 与 `file_manager.get_desktop_path` 的一致性表述
+      （前者只在为空时回退、后者在目录不存在时也回退；fail-closed 但措辞夸大）。
+
 - [ ] **AW-7 修文件监控搬走「半成品」（健壮性，但有真实数据风险）**
       问题：`file_watcher.py:32,66-85` 防抖只有 500ms 且**不判断文件是否写完**，
       大文件正在复制时会被 `categorize_file`（`file_manager.py:86`）移走半个文件。
