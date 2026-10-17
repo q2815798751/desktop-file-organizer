@@ -164,6 +164,110 @@ class TestGetCategoryFolder(TempDirsMixin, unittest.TestCase):
         self.assertEqual(os.path.dirname(folder), self.storage)
 
 
+# ── AW-3：folder 字段越界必须被拒绝 ──────────────────────
+
+class TestCategoryFolderSafety(TempDirsMixin, unittest.TestCase):
+    """folder 来自用户自由文本，越界（逃出存储根）必须**拒绝**而不是静默兜底。"""
+
+    def _cat(self, folder):
+        return {"name": "恶意分类", "extensions": ["evil"], "folder": folder}
+
+    def assertRejected(self, folder):
+        cfg = self.make_config()
+        with self.assertRaises(file_manager.UnsafeCategoryFolder):
+            file_manager.get_category_folder(cfg, self._cat(folder))
+
+    # —— 被拒绝的三种形态 ——
+
+    def test_rejects_windows_parent_traversal(self):
+        # 任务点名的 `..\..\evil`
+        self.assertRejected("..\\..\\evil")
+
+    def test_rejects_posix_parent_traversal(self):
+        self.assertRejected("../../evil")
+
+    def test_rejects_absolute_posix_path(self):
+        self.assertRejected(os.path.join(os.path.abspath(os.sep), "evil_abs"))
+
+    def test_rejects_absolute_windows_path(self):
+        self.assertRejected("C:\\Windows\\evil")
+
+    def test_rejects_rooted_backslash_path(self):
+        # 以分隔符开头（Windows 上是「当前盘根」）也算绝对路径
+        self.assertRejected("\\evil")
+
+    def test_rejects_nested_parent_traversal(self):
+        # 含 `..` 的嵌套路径
+        self.assertRejected("a\\..\\..\\evil")
+        self.assertRejected("sub/../../evil")
+
+    def test_rejects_dotdot_even_if_it_resolves_back_inside(self):
+        # 绕回存储根内也不放行：这种写法只可能是有意为之
+        self.assertRejected("sub/../evil")
+
+    def test_rejects_dot_alone(self):
+        # 解析后等于存储根本身 → 不是「子文件夹」
+        self.assertRejected(".")
+
+    def test_rejects_empty_folder(self):
+        self.assertRejected("")
+        self.assertRejected("   ")
+
+    def test_rejects_when_missing_folder_falls_back_to_malicious_name(self):
+        # folder 缺省时回退到 name，name 本身越界同样要拒
+        cfg = self.make_config()
+        cat = {"name": "..\\..\\evil", "extensions": []}
+        with self.assertRaises(file_manager.UnsafeCategoryFolder):
+            file_manager.get_category_folder(cfg, cat)
+
+    def test_rejection_message_is_explicit(self):
+        cfg = self.make_config()
+        with self.assertRaises(file_manager.UnsafeCategoryFolder) as ctx:
+            file_manager.get_category_folder(cfg, self._cat("..\\..\\evil"))
+        self.assertIn("不安全", str(ctx.exception))
+
+    # —— 正常 folder 仍能解析 ——
+
+    def test_normal_folder_still_resolves(self):
+        cfg = self.make_config()
+        cat = {"name": "图片", "extensions": [], "folder": "pics"}
+        self.assertEqual(
+            file_manager.get_category_folder(cfg, cat),
+            os.path.join(self.storage, "pics"),
+        )
+
+    def test_nested_folder_without_dotdot_still_resolves(self):
+        cfg = self.make_config()
+        cat = {"name": "x", "extensions": [], "folder": "sub/deeper"}
+        got = file_manager.get_category_folder(cfg, cat)
+        self.assertEqual(
+            os.path.normpath(got),
+            os.path.normpath(os.path.join(self.storage, "sub", "deeper")),
+        )
+        self.assertInsideTmp(got)
+
+    def test_default_categories_still_resolve(self):
+        cfg = self.make_config()
+        for cat in CATEGORIES:
+            got = file_manager.get_category_folder(cfg, cat)
+            self.assertEqual(os.path.dirname(got), self.storage)
+            self.assertInsideTmp(got)
+
+    # —— 纯函数本身（GUI 直接调用它做校验）——
+
+    def test_pure_function_returns_none_for_safe_name(self):
+        self.assertIsNone(file_manager.category_folder_error(self.storage, "pics"))
+        self.assertIsNone(
+            file_manager.category_folder_error(self.storage, "sub/deeper")
+        )
+
+    def test_pure_function_returns_message_for_unsafe_name(self):
+        for bad in ["..\\..\\evil", "../../evil", "C:\\Windows", "/etc", "", "."]:
+            err = file_manager.category_folder_error(self.storage, bad)
+            self.assertIsNotNone(err, f"{bad!r} 应被判为不安全")
+            self.assertTrue(err.strip())
+
+
 # ── _resolve_conflict ────────────────────────────────────
 
 class TestResolveConflict(TempDirsMixin, unittest.TestCase):

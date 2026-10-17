@@ -1121,6 +1121,17 @@ class Dashboard(QMainWindow):
                 QMessageBox.warning(self, "提示", f"分类「{name}」已存在。")
                 return
 
+            # 子文件夹名越界校验（AW-3）：folder 来自自由文本，可能写成
+            # ..\..\evil 之类把文件移出存储根目录的值。判断逻辑抽成可单测的
+            # 纯函数 category_folder_error，这里只负责展示与拦截。
+            from file_manager import category_folder_error, get_storage_root
+            folder_err = category_folder_error(
+                get_storage_root(self.config), folder or name
+            )
+            if folder_err:
+                QMessageBox.warning(self, "提示", f"子文件夹名无效：{folder_err}")
+                return
+
             # 添加分类
             new_cat = {"name": name, "extensions": extensions, "folder": folder or name}
             self.config["categories"].append(new_cat)

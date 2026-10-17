@@ -86,10 +86,82 @@ def get_storage_root(config):
     return os.path.join(os.path.expanduser("~"), "Documents", DEFAULT_STORAGE_NAME)
 
 
+class UnsafeCategoryFolder(ValueError):
+    """
+    分类的 `folder` 字段不安全（会逃出存储根目录），拒绝使用。
+
+    继承 `ValueError`，便于调用方按「配置错误」统一处理。之所以**抛异常**而不是
+    返回 `None` 或悄悄改用别的目录：静默兜底会把「配置有问题」这件事藏起来，
+    继续把用户的文件搬到错误位置——这比直接报错危险得多。
+    """
+
+
+def category_folder_error(storage_root, folder_name):
+    """
+    纯函数：校验分类的 `folder` 字段是否会逃出存储根目录。
+
+    返回 `None` 表示安全；否则返回一句中文错误说明（GUI 可直接展示给用户）。
+
+    `folder` 字段来自用户自由文本（新建分类时填的「子文件夹名」），
+    直接 `os.path.join(storage_root, folder)` 时：
+    - `..\\..\\evil` 会解析到存储根之外；
+    - 绝对路径（`C:\\Windows\\...` / `/etc`）会让 `join` **丢掉**存储根；
+    两者都会把用户的桌面文件移出存储根目录。
+
+    校验规则（在**任何平台**上行为一致——`\\` 与 `/` 都当分隔符，
+    所以 `..\\..\\evil` 这种 Windows 写法在 POSIX 上也会被拒绝）：
+    1. 非空；
+    2. 不是绝对路径（不以分隔符开头、无盘符）；
+    3. 不含任何 `..` 上级目录组件；
+    4. 兜底用 `os.path.commonpath` 再确认解析后的路径确实落在存储根**内部**
+       （严格子路径，等于存储根本身也算越界）。
+    """
+    if folder_name is None:
+        return "子文件夹名不能为空。"
+    name = str(folder_name).strip()
+    if not name:
+        return "子文件夹名不能为空。"
+
+    # 绝对路径（以分隔符开头，或带盘符）→ 拒绝
+    if os.path.isabs(name) or name[0] in ("/", "\\"):
+        return "子文件夹名不能是绝对路径。"
+
+    # 含「..」上级目录引用 → 拒绝（哪怕它恰好又绕回存储根内也不放行，
+    # 这种写法只可能是有意为之，没有正当用途）
+    parts = [p for p in name.replace("\\", "/").split("/") if p not in ("", ".")]
+    if ".." in parts:
+        return "子文件夹名不能包含「..」上级目录引用。"
+
+    # 兜底：用 commonpath 再确认解析结果严格落在存储根内部
+    try:
+        root = os.path.abspath(storage_root)
+        target = os.path.abspath(os.path.join(root, name))
+        common = os.path.commonpath([root, target])
+    except ValueError:
+        # 不同盘符 / 无法比较 → 一定越界
+        return "子文件夹名越出了存储目录。"
+    if common != root or target == root:
+        return "子文件夹名越出了存储目录。"
+
+    return None
+
+
 def get_category_folder(config, category):
-    """获取分类对应的子文件夹完整路径（位于存储根目录下，而非桌面）。"""
+    """
+    获取分类对应的子文件夹完整路径（位于存储根目录下，而非桌面）。
+
+    ⚠️ 安全：`folder` 字段来自用户自由文本，可能越界（`..\\..\\evil`、绝对路径等），
+    因此这里做越界校验：越界则抛 `UnsafeCategoryFolder`，**绝不静默兜底**到别处。
+    """
     folder_name = category.get("folder", category["name"])
-    return os.path.join(get_storage_root(config), folder_name)
+    root = get_storage_root(config)
+    error = category_folder_error(root, folder_name)
+    if error:
+        raise UnsafeCategoryFolder(
+            f"分类「{category.get('name', folder_name)}」的子文件夹名不安全："
+            f"{folder_name!r}（{error}）"
+        )
+    return os.path.join(root, folder_name)
 
 
 def init_folders(config):
