@@ -163,7 +163,7 @@
       全程 `tempfile.TemporaryDirectory()` + `mock.patch("config.CONFIG_PATH", 临时路径)`
       （`init_folders` 会调 `save_config`），未在真实桌面验证，仓库根目录未生成 `config.json`。
 
-- [ ] **AW-15 加固「配置损坏」的回退方向（AW-1 复查实测出的隐患，数据安全）**
+- [x] **AW-15 加固「配置损坏」的回退方向（AW-1 复查实测出的隐患，数据安全）**
       > 编号是后补的，但**位置在此处表示它比 AW-3 及之后的所有条目优先**。
 
       AW-1 的对抗性复查**实测**出两个隐患，AW-1 本身没覆盖：
@@ -187,6 +187,32 @@
       ⚠️ 同时把 AW-0/AW-1 复查点名的覆盖缺口一并补上：
       **`init_folders` 的 `first_run=True` 分支**、`_move_matching_files`、`get_files_in_category`。
       （如果 AW-2 已经补过，这里只需确认并补漏。）
+      ✅ 已完成（2026-10-17）：实际 **91** 个用例（80 → 91，净增 11 条，全在 `tests/test_config.py`），
+      `python -m unittest discover -s tests -v` 全绿。两条一起做：
+      - **(a) 回退方向改为保守**：`load_config` 现在只区分两种情形——
+        「配置文件**不存在**」= 真首次运行（仍返回 `initialized=False`）；
+        「文件**存在但读不出来**」（半截 JSON / 非法 JSON / 非 UTF-8 字节 / 读取 OSError /
+        合法 JSON 但不是对象）→ 备份成 `config.json.corrupt-<时间戳>` 后回退默认值，但
+        **强制 `initialized=True`**。理由：配置文件存在本身就证明程序跑过一次
+        （首次运行时 `load_config` 会立刻把默认配置落盘），而 `False` 会让 `init_folders`
+        再搬一次整个桌面；宁可少搬（用户可手动整理），也不能二次搬移。
+      - **(b) 删掉 `_salvage_initialized`**（连同 `import re`）：它用 `re.search` 取第一个匹配
+        且不分层级，会被无关的嵌套键骗到危险方向。按 (a) 改完后抢救不再必要，
+        删掉比留着安全（加了一条 `hasattr` 用例钉住「这段会骗人的代码已删除」）。
+      新增/改写用例（共 11 条）：截断在 `initialized` 之前 → 断言按「跑过」处理且**不二次搬移**；
+      嵌套 `initialized` 在前/在后两种 → 断言不被骗（含端到端不二次搬移）；无法解码的二进制配置
+      → 断言备份逐字节等于原内容且不二次搬移；读取 OSError（打桩 `builtins.open`）→ 按「跑过」；
+      合法 JSON 但非对象（`[]`）→ 按损坏处理；损坏文本里写着 `initialized:false` → 仍按「跑过」；
+      **配置文件不存在 → 断言仍按首次运行处理并真的搬移**（这条不能改坏，否则新装用户第一次跑
+      就不搬文件了）。
+      AW-0/AW-1 复查点名的覆盖缺口（`init_folders` 的 `first_run=True` 分支 /
+      `_move_matching_files` / `get_files_in_category`）AW-2 已补齐，本轮确认无漏。
+      反向验证：`cp` 备份后 `git checkout -- config.py` 撤掉修复，`git diff -- config.py`
+      确认为空且 `grep _salvage_initialized` 命中旧函数（**回退已生效**）→ 重跑得 **11 failed**，
+      其中 3 条端到端用例的断言输出正是「损坏配置不得再次搬移桌面文件」，即**二次搬移真的发生了**
+      （在旧代码上实测复现，不是推断）；装回修复后恢复 91 全绿。
+      全程 `mock.patch("config.CONFIG_PATH", 临时路径)` + `tempfile.TemporaryDirectory()`，
+      未在真实桌面验证，仓库根目录未生成 `config.json`。
 
 - [ ] **AW-16 补跨盘分支的测试覆盖 + 清掉半拷贝残留（AW-2 复查实测，健壮性）**
       > 编号后补，位置在此 = 排在 AW-15 之后、AW-3 之前。
