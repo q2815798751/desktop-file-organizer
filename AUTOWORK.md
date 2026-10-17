@@ -414,7 +414,7 @@
       全程 `tempfile.TemporaryDirectory()` 造目录、config 字典指向临时路径，
       未在真实桌面验证，仓库根目录未生成 `config.json`（`git status` 仅 3 个预期改动文件）。
 
-- [ ] **AW-19 处置 `UnsafeCategoryFolder`（AW-3 引入的回归）+ junction 逃逸（AW-3 复查实测）**
+- [x] **AW-19 处置 `UnsafeCategoryFolder`（AW-3 引入的回归）+ junction 逃逸（AW-3 复查实测）**
 
       AW-3 的对抗性复查确认「核心路径越界都挡住了」（绝对路径、`..`、UNC、盘符、
       空/`.`/纯分隔符，定点破坏 11 红），**但实测出两个必须处理的问题**：
@@ -452,6 +452,44 @@
       **3. 次要**：非字符串 `folder`（如 `"folder": 123`）——`category_folder_error` 先 `str()` 判为安全，
       但 `get_category_folder` 对原始值 `os.path.join(root, 123)` 抛 `TypeError`（不是 `UnsafeCategoryFolder`）。
       仅手工改 JSON 可达，顺手统一成同一种错误类型。
+      ✅ 已完成（2026-10-17）：实际 **141** 个用例（126 → 141，净增 15 条：
+      `tests/test_file_manager.py` 新增 `TestUnsafeCategoryDegradation` 12 条 +
+      `tests/test_init_folders.py` 新增 `TestUnsafeCategoryDoesNotCrashStartup` 3 条），
+      `python -m unittest discover -s tests -v` 全绿。
+      - **(1) 🔴 回归修复（可见的降级）**：新增 `safe_category_folder(config, category)`
+        ——`get_category_folder` 的「绝不抛」变体：坏配置时记一条 ERROR 日志并返回 `None`，
+        调用点据此**跳过该分类**。四个入口全改用它：`init_folders`（跳过并计入新增的
+        `MoveStats.skipped` 字段）、`categorize_file`（跳过继续找别的安全分类）、
+        `get_files_in_category`（返回 `[]`）、`move_into_category`（返回 `(None, None)`）。
+        GUI 里三处直接调 `get_category_folder` 的地方（`dashboard._on_new_folder` /
+        `_update_status`、`panel_manager.add_category`）也改成 `safe_category_folder` +
+        `None` 处理。`main.py` 在 `init_folders` 后若 `skipped>0` 弹一个 `QMessageBox` 提示。
+        新增纯函数 `unsafe_category_message` 生成「分类「X」的目录名不安全，已跳过：…」文案。
+        **坏配置下应用能启动**（`init_folders` 不再抛 → `MainApp.__init__` 不崩）；
+        **用户会看到**：启动时一个警告弹窗 + ERROR 日志，该分类被跳过、其余分类照常工作。
+      - **(2) junction / 符号链接逃逸**：选「**realpath 复检并拒绝落在根外的**」
+        （新增 `realpath_escape_error`；`get_category_folder` 在词法校验后对最终目标
+        `os.path.realpath` 复检，`commonpath` 不等于 realpath(root) 即判越界）。
+        理由：核心安全承诺是「桌面文件只在存储根内搬动」，junction（`mklink /J` 免管理员）
+        会被同步软件/恶意程序悄悄植入；且本项已把「拒绝」变成可见的降级，代价很低。
+        真正要换盘的用户应改 `storage_path`，而非链单个分类目录。
+        **用真实 `mklink /J` 复现**：词法校验放行、realpath 复检拒绝
+        （用例 `test_real_junction_escape_is_rejected`，实际执行、非 skip）。
+      - **(3) 非字符串 folder 统一**：`category_folder_error` 对非字符串返回
+        「子文件夹名必须是文本。」，于是 `get_category_folder` 对 `"folder": 123` 抛的是
+        `UnsafeCategoryFolder`（不再是 `TypeError`）——校验与解析行为一致。
+      反向验证（三步**定点破坏**，未用 `git checkout origin/master -- <文件>` 那种超集回退；
+      每步先 `git diff` 确认 `BREAK` 标记生效）：
+      (A) 把 `safe_category_folder` 改回「直接 `return get_category_folder(...)`」→ 重跑得
+          **9 ERROR**，正是四条链的降级用例 + 真实 junction 用例；
+      (B) 把 `escape = realpath_escape_error(...)` 改成 `escape = None` → 重跑得 **1 FAIL**，
+          正是 `test_real_junction_escape_is_rejected`（证明 realpath 复检是判别性的）；
+      (C) 把 `isinstance` 守卫改回 `if False:` + `str(folder_name).strip()` → 重跑得
+          **1 FAIL + 2 ERROR**，正是三条非字符串用例。
+      装回后 `grep BREAK` 0 命中、恢复 141 全绿。
+      全程 `tempfile.TemporaryDirectory()`（junction 也在临时目录内建、`os.rmdir` 删链接）+
+      `mock.patch("config.CONFIG_PATH", 临时路径)`；未运行 `main.py` / `restore_files.py`，
+      未在真实桌面验证，仓库根目录未生成 `config.json`（`git status` 仅 7 个预期改动文件）。
 
 - [ ] **AW-4 修 `move_into_category` 允许移入存储根祖先（数据安全）**
       问题：`file_manager.py:153-159` 只拒绝「分类文件夹本身」和「存储根」，
