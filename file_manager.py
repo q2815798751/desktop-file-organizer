@@ -174,6 +174,33 @@ def stability_decision(stable, retries, max_retries):
     return ACTION_RETRY
 
 
+# ── 安全取大小（AW-9） ───────────────────────────────────
+#
+# 界面在渲染文件列表/搜索结果时要对每个条目取 `os.path.getsize`。但从「列出目录」
+# 到「逐条取大小」之间文件可能已被删除或移走（后台归类、用户手动操作、同步软件），
+# 此时 `os.path.getsize` 抛 `OSError`，未捕获会让**整个列表/搜索渲染崩掉**。
+# 取不到大小不是致命错误——显示一个占位符即可。
+SIZE_PLACEHOLDER = "—"  # 取不到大小时显示的占位（em dash）
+
+
+def safe_size(path, getsize=os.path.getsize):
+    """
+    **纯函数**：安全地取文件大小（字节）。
+
+    取不到（文件已被删除/移走、权限不足、符号链接失效、路径是目录等）时，
+    `getsize` 会抛 `OSError`（或其子类 `FileNotFoundError` / `PermissionError` /
+    `NotADirectoryError` …）；本函数一律吞掉并返回占位符 `SIZE_PLACEHOLDER`，
+    **绝不向上抛异常**——单个条目消失不应让整屏渲染崩溃。
+
+    `getsize` 可注入，便于单测各种 `OSError` 子类（默认 `os.path.getsize`）。
+    正常文件返回真实大小（int，单位字节）。
+    """
+    try:
+        return getsize(path)
+    except OSError:
+        return SIZE_PLACEHOLDER
+
+
 def get_desktop_path(config):
     """获取桌面路径（确保目录存在）。"""
     path = config.get("desktop_path", "")

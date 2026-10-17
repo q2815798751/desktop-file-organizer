@@ -1236,7 +1236,7 @@ class Dashboard(QMainWindow):
     # ═══════════════════════════════════════════════════════
 
     def _load_files(self, category):
-        from file_manager import get_files_in_category
+        from file_manager import get_files_in_category, safe_size
 
         self._file_tree.clear()
         self._all_files_cache = []
@@ -1266,7 +1266,13 @@ class Dashboard(QMainWindow):
             if is_dir:
                 size_str = "文件夹"
             else:
-                size_str = self._format_size(os.path.getsize(full_path))
+                # 文件可能在「列出」与「取大小」之间被删/被移；safe_size 取不到时
+                # 返回占位符而不是抛 OSError 让整屏渲染崩掉（AW-9）。
+                raw_size = safe_size(full_path)
+                size_str = (
+                    raw_size if isinstance(raw_size, str)
+                    else self._format_size(raw_size)
+                )
             time_str = mtime.strftime("%Y-%m-%d %H:%M")
 
             tree_item = QTreeWidgetItem()
@@ -1379,7 +1385,7 @@ class Dashboard(QMainWindow):
 
         all_results = []
         for cat in self.config["categories"]:
-            from file_manager import get_files_in_category
+            from file_manager import get_files_in_category, safe_size
             files = get_files_in_category(self.config, cat)
             for full_path, name, mtime in files:
                 if query in name.lower():
@@ -1393,7 +1399,13 @@ class Dashboard(QMainWindow):
             if is_dir:
                 size_str = "文件夹"
             else:
-                size_str = self._format_size(os.path.getsize(full_path))
+                # 搜索结果条目可能在「列出」与「取大小」之间被删/被移；safe_size
+                # 取不到时返回占位符而不是抛 OSError 让整个搜索崩掉（AW-9）。
+                raw_size = safe_size(full_path)
+                size_str = (
+                    raw_size if isinstance(raw_size, str)
+                    else self._format_size(raw_size)
+                )
             time_str = mtime.strftime("%Y-%m-%d %H:%M")
 
             tree_item = QTreeWidgetItem()

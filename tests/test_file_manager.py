@@ -1099,5 +1099,107 @@ class TestArrangeDesktopIcons(unittest.TestCase):
         self.assertFalse(ok)
 
 
+class TestSafeSize(unittest.TestCase):
+    """
+    AW-9：渲染文件列表/搜索结果时对每个条目取大小，绝不能因单个文件在
+    「列出」与「取大小」之间被删/被移（或权限不足、链接失效）而整屏崩溃。
+
+    `safe_size` 是 file_manager 里的纯函数（GUI 模块 dashboard.py 不导入），
+    故在此直接单测；dashboard.py 只做 py_compile 静态检查。
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = self._tmp.name
+
+    def test_missing_path_returns_placeholder_not_raise(self):
+        # 核心回归点：文件在「列出」与「取大小」之间被删/被移 → 不得抛 OSError
+        missing = os.path.join(self.tmp, "已消失.txt")
+        self.assertFalse(os.path.exists(missing))
+        result = file_manager.safe_size(missing)  # 不得抛出
+        self.assertEqual(result, file_manager.SIZE_PLACEHOLDER)
+
+    def test_existing_file_returns_real_size(self):
+        # 正常文件 → 返回真实大小（int，字节）
+        p = os.path.join(self.tmp, "real.bin")
+        with open(p, "wb") as f:
+            f.write(b"0123456789")  # 10 字节
+        self.assertEqual(file_manager.safe_size(p), 10)
+        self.assertIsInstance(file_manager.safe_size(p), int)
+
+    def test_directory_returns_real_size_and_does_not_raise(self):
+        # 路径是目录：真实 os.path.getsize 对目录返回 int（不抛），故不该给占位符
+        d = os.path.join(self.tmp, "a_dir")
+        os.mkdir(d)
+        result = file_manager.safe_size(d)  # 不得抛出
+        self.assertIsInstance(result, int)
+        self.assertNotEqual(result, file_manager.SIZE_PLACEHOLDER)
+
+    def test_permission_denied_returns_placeholder(self):
+        # PermissionError 是 OSError 子类：权限不足 → 占位，不抛
+        def denied(_path):
+            raise PermissionError(13, "Access is denied")
+
+        self.assertEqual(
+            file_manager.safe_size("whatever", getsize=denied),
+            file_manager.SIZE_PLACEHOLDER,
+        )
+
+    def test_broken_symlink_returns_placeholder(self):
+        # 失效符号链接：getsize 跟随链接、对不存在的目标抛 FileNotFoundError。
+        # 本机普通用户无创建符号链接权限（实测 os.symlink 抛 WinError 1314），
+        # 无权限时退化为注入 getsize 忠实模拟该异常；有权限则走真实文件系统。
+        link = os.path.join(self.tmp, "dangling_link")
+        try:
+            os.symlink(os.path.join(self.tmp, "no_such_target"), link)
+        except OSError:
+            def broken(_path):
+                raise FileNotFoundError(2, "No such file or directory")
+
+            self.assertEqual(
+                file_manager.safe_size("dangling", getsize=broken),
+                file_manager.SIZE_PLACEHOLDER,
+            )
+            return
+        self.assertEqual(
+            file_manager.safe_size(link), file_manager.SIZE_PLACEHOLDER
+        )
+
+    def test_each_oserror_subclass_is_swallowed(self):
+        # 不同的 OSError 子类都应被吞成占位，绝不上抛
+        for exc_type in (
+            FileNotFoundError,
+            PermissionError,
+            NotADirectoryError,
+            IsADirectoryError,
+            OSError,
+        ):
+            def raiser(_path, _exc=exc_type):
+                raise _exc("boom")
+
+            with self.subTest(exc=exc_type.__name__):
+                self.assertEqual(
+                    file_manager.safe_size("x", getsize=raiser),
+                    file_manager.SIZE_PLACEHOLDER,
+                )
+
+    def test_injected_getsize_receives_the_path(self):
+        # 窄接口契约：safe_size 把 path 原样透传给 getsize，并返回其结果
+        seen = []
+
+        def spy(path):
+            seen.append(path)
+            return 4242
+
+        self.assertEqual(file_manager.safe_size("p/ath", getsize=spy), 4242)
+        self.assertEqual(seen, ["p/ath"])
+
+    def test_placeholder_is_a_string_distinct_from_sizes(self):
+        # 占位符是字符串，与真实大小（int）类型可区分——调用方据此决定是否 _format_size
+        self.assertIsInstance(file_manager.SIZE_PLACEHOLDER, str)
+        self.assertFalse(isinstance(file_manager.SIZE_PLACEHOLDER, int))
+
+
 if __name__ == "__main__":
     unittest.main()
