@@ -214,7 +214,7 @@
       全程 `mock.patch("config.CONFIG_PATH", 临时路径)` + `tempfile.TemporaryDirectory()`，
       未在真实桌面验证，仓库根目录未生成 `config.json`。
 
-- [ ] **AW-16 补跨盘分支的测试覆盖 + 清掉半拷贝残留（AW-2 复查实测，健壮性）**
+- [x] **AW-16 补跨盘分支的测试覆盖 + 清掉半拷贝残留（AW-2 复查实测，健壮性）**
       > 编号后补，位置在此 = 排在 AW-15 之后、AW-3 之前。
 
       AW-2 的对抗性复查**确认「TOCTOU 窗口已真的关掉」**：四种路径组合（文件/目录 × 同盘/跨盘）
@@ -239,6 +239,37 @@
          这个项目是 Windows 专用（大量 `ctypes.windll`），所以**不是 bug**，
          但**必须在代码注释里写明这个前提**，否则将来有人移植会踩。
       验证方式：新增的跨盘用例**撤掉修复后应变红**（先 `git diff` 确认回退生效）。
+      ✅ 已完成（2026-10-17）：实际 **98** 个用例（91 → 98，净增 7 条，全在
+      `tests/test_init_folders.py`：`TestCrossDriveDirectoryMove` 4 条 +
+      `TestPartialMoveCleanup` 3 条），`python -m unittest discover -s tests -v` 全绿。
+      - **(1) 跨盘目录分支覆盖**：新增 4 条，用 `mock.patch("file_manager.os.rename",
+        side_effect=OSError(errno.EXDEV))` 强制走 `copytree`。含：同盘时**不**碰
+        copytree 的对照组；跨盘搬移成功（`copytree` 确被调用、内容保留、源删除）；
+        跨盘 + 目标已占 → 改名到 `proj(1)` 且旧目录内容不被覆盖/不嵌套；
+        用 racy 桩逼 `copytree` 的 `makedirs` 撞上已占目标名（FileExistsError）
+        → 换名重试、不覆盖。
+      - **(2) 半拷贝残留清理**：把 `_release_placeholder`（只在大小为 0 时才删）换成
+        `_cleanup_partial(dest, is_dir)` + 新增 `PartialMoveError`。文件占位由
+        `O_CREAT|O_EXCL` 独占创建、**一定是自己的**，故失败时无条件删除
+        （跨盘 `copy2` 已写入非空半截也能清）；目录分支 `copytree` 中途失败时
+        删掉半拷贝树（`copytree` 的 FileExistsError 分支不清，那不是我们的）；
+        清理本身也失败时抛 `PartialMoveError`，把**残留路径**放进 `.residual`
+        上报给调用方（满足「至少上报」的要求）。
+      - **(3) 写明平台前提**：模块 docstring + `_move_dir_no_clobber` +
+        `_move_no_clobber` 三处注释写清「no-clobber 保证隐含依赖 Windows 的
+        `os.rename` 语义（目标已存在一律 FileExistsError、从不替换），POSIX 会
+        静默替换，移植前必改」。
+      反向验证（两步，回退前都先 `git diff` 确认生效）：
+      (1) `cp` 备份后 `git checkout -- file_manager.py` 撤掉**整个**修复，
+      `git diff --stat` 确认 file_manager.py 已无改动、`grep PartialMoveError` 0 命中
+      → 重跑得 **3 failed**（全是新增的 `TestPartialMoveCleanup`；4 条跨盘用例仍绿，
+      因为该分支 AW-2 已实现，本轮只是补回归网）。
+      (2) 装回修复后，只把 `_move_dir_no_clobber` 的 EXDEV 处理改回「直接 raise」
+      （即废掉 copytree 分支），`git diff` 确认 `BREAK: EXDEV not handled` 已生效
+      → 重跑得 **4 failed**，其中 **3 条正是 `TestCrossDriveDirectoryMove`** 的跨盘
+      用例（证明它们真的在压 copytree 分支，不是摆设）。装回修复后恢复 98 全绿。
+      全程 `tempfile.TemporaryDirectory()` + `mock.patch("config.CONFIG_PATH", 临时路径)`，
+      未在真实桌面验证，仓库根目录未生成 `config.json`。
 
 - [ ] **AW-3 修分类 `folder` 字段的路径越界（数据安全）**
       问题：`file_manager.py:30-33` 直接 `os.path.join(storage_root, folder)`，
