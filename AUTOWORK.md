@@ -533,7 +533,7 @@
       未在真实桌面验证，仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在；
       `git status` 仅 2 个预期改动文件）。
 
-- [ ] **AW-5 修回收站删除的标志位与结果判定（正确性）**
+- [x] **AW-5 修回收站删除的标志位与结果判定（正确性）**
       问题：`dashboard.py:1611-1613` 把 `SHERB_NOCONFIRMATION/NOPROGRESSUI/NOSOUND`
       （那是 `SHEmptyRecycleBin` 的标志）当成 `FOF_*` 用，导致 `FOF_NOCONFIRMATION(0x10)`
       实际没设，系统仍会弹确认框；且 `dashboard.py:1643-1645` **从不检查
@@ -544,6 +544,41 @@
       注意：这段是 GUI 代码，**把「标志位常量」和「结果判定」抽成可单测的纯函数**
       （例如 `build_delete_flags()` 和 `interpret_delete_result(result, aborted)`），
       再对这两个纯函数写用例——不要在测试里真的调用 `SHFileOperation`。
+      ✅ 已完成（2026-10-17）：实际 **165** 个用例（153 → 165，净增 12 条，全在
+      `tests/test_file_manager.py`：`TestBuildDeleteFlags` 4 条 +
+      `TestInterpretDeleteResult` 5 条 + `TestDeleteResultCounting` 3 条），
+      `python -m unittest discover -s tests -v` 全绿。
+      - **怎么让它可验证（GUI 不能 import）**：两个纯函数放在**非 GUI 模块**
+        `file_manager.py`（无 PyQt5 依赖、可直接 import）——`build_delete_flags()` 返回
+        `FOF_ALLOWUNDO(0x40)|FOF_NOCONFIRMATION(0x10)|FOF_NOERRORUI(0x400)|FOF_SILENT(0x4)`
+        = **0x0454**（旧写法误用 `SHERB_*` 只得到 0x40|0x1|0x2|0x4=0x47，**恰好漏掉 0x10**）；
+        `interpret_delete_result(result, aborted)` 返回 `result == 0 and not aborted`
+        （旧写法只看 `result == 0`，把用户点「取消」也算成功）。`dashboard.py` 的
+        `_send_to_recycle_bin` 改用这两个纯函数：`fFlags = build_delete_flags()`，
+        调用后 `if not interpret_delete_result(result, shfile.fAnyOperationsAborted):`
+        被取消则 `return False`、真错误才抛 `OSError`；调用方 `_on_delete_files` 改为
+        `if _send_to_recycle_bin(fp): deleted += 1`——被取消不计入成功数。
+      - 用例覆盖：标志位 4 个必需位是否都在、0x10 判别性（`SHERB_*` 恰好没有）、精确值 0x454、
+        不等于旧值；结果判定含「成功→True」「取消→False（回归点）」「非 0→False」
+        「非 0 且取消→False」「ctypes BOOL 整型 0/1/12345 的假值/真值」；
+        另复刻 `_on_delete_files` 的计数写法断言「取消不计入、真删才计入」。
+      - 测试**不调用**真实 `SHFileOperation`（那会真删文件），`dashboard.py` **未 import**，
+        只做 `py_compile` 静态检查（`dashboard.py`/`desktop_panel.py`/`panel_manager.py`/
+        `main.py`/`file_manager.py` 均通过）。
+      反向验证（**两步定点破坏**，未用 `git checkout origin/master -- <文件>` 那种超集回退；
+      每步先 `git diff` 确认 `BREAK` 标记生效、`grep BREAK` 命中）：
+      (a) 把 `build_delete_flags` 改回旧的 `FOF_ALLOWUNDO|0x1|0x2|0x4`（`SHERB_*` 冒充
+          `FOF_*`）→ 重跑得 **3 failed**，正是三条标志位用例
+          （`test_all_four_required_flags_set` / `test_noconfirmation_bit_is_present_the_regression`
+          / `test_exact_value`）；
+      (b) 把 `interpret_delete_result` 改回 `return result == 0`（不查 `fAnyOperationsAborted`）
+          → 重跑得 **4 failed**，正是四条「取消/取消计数」用例
+          （`test_cancelled_is_not_success_the_regression` / `test_aborted_accepts_ctypes_bool_int`
+          / `test_cancelled_delete_not_counted` / `test_only_real_deletes_counted`）。
+      装回后 `grep BREAK` 0 命中、恢复 165 全绿。
+      全程未运行 `main.py` / `restore_files.py`，未在真实回收站上做实验，未在真实桌面验证，
+      仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在；`git status` 仅 3 个
+      预期改动文件）。
 
 - [ ] **AW-6 修 `restore_files.py` 硬编码路径与分类清单（数据安全）**
       问题：`restore_files.py:12` 把桌面写死成 `~/Desktop`，无视 `config.desktop_path`
