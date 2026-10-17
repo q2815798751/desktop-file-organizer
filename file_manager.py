@@ -355,6 +355,74 @@ def unsafe_category_message(category, error):
     return f"分类「{name}」的目录名不安全，已跳过：{error}"
 
 
+def _normalize_ext(ext):
+    """把扩展名归一化：转小写、去掉首尾空白与前导点。非字符串返回空串。"""
+    if not isinstance(ext, str):
+        return ""
+    return ext.strip().lower().lstrip(".")
+
+
+def extension_conflicts(categories, extensions, exclude=None):
+    """
+    **纯函数**：找出 `extensions` 与其它分类已声明的扩展名**重叠**的部分。
+
+    返回 `[(扩展名, 冲突分类名), ...]`（按扩展名首次出现顺序、去重）；无重叠返回 `[]`。
+
+    ⚠️ 为什么需要检测（AW-11）：`categorize_file` 遍历 `config["categories"]`
+    并**取首个匹配**的分类，所以同一个扩展名被两个分类声明时，文件会路由到
+    **由分类顺序决定**的不确定分类（`init_folders` 的首次整理同理：先遍历到的分类
+    先把桌面文件搬走）。这是配置歧义，**不是设计特性**——默认分类之间没有任何重叠，
+    也没有任何「优先级」机制，所以「首个匹配」只是循环的自然写法，而非有意的优先规则。
+
+    - `exclude`：要排除的分类（**编辑**某个分类时传它自己）。按**对象身份**排除，
+      而不是按名字——编辑时分类名可能在同一操作里被改掉，按名字会排除错。
+    """
+    exclude_id = id(exclude) if exclude is not None else None
+
+    wanted = []
+    seen = set()
+    for e in extensions or []:
+        n = _normalize_ext(e)
+        if n and n not in seen:
+            seen.add(n)
+            wanted.append(n)
+    if not wanted:
+        return []
+
+    conflicts = []
+    for n in wanted:
+        for cat in categories or []:
+            if exclude_id is not None and id(cat) == exclude_id:
+                continue
+            if not isinstance(cat, dict):
+                continue
+            cat_exts = set()
+            for e in cat.get("extensions") or []:
+                en = _normalize_ext(e)
+                if en:
+                    cat_exts.add(en)
+            if n in cat_exts:
+                # 每个扩展名只报**首个**声明它的分类（与 categorize_file 的首个匹配一致）
+                conflicts.append((n, cat.get("name", "?")))
+                break
+    return conflicts
+
+
+def extension_conflict_error(categories, extensions, exclude=None):
+    """
+    纯函数：把扩展名重叠翻译成一句**用户可见**的中文提示（无冲突则返回 None）。
+
+    供 GUI 在新建/编辑分类**保存前**调用：有冲突就拦截保存（与 AW-3 的
+    `category_folder_error` 同样的「校验 → 提示 → 阻止」模式），避免产生
+    「同一扩展名归到哪个分类由分类顺序决定」的歧义配置。
+    """
+    conflicts = extension_conflicts(categories, extensions, exclude=exclude)
+    if not conflicts:
+        return None
+    parts = "、".join(f"{ext}（{cat}）" for ext, cat in conflicts)
+    return f"扩展名与已有分类重叠：{parts}。请先修改扩展名，或编辑相关分类。"
+
+
 def get_category_folder(config, category):
     """
     获取分类对应的子文件夹完整路径（位于存储根目录下，而非桌面）。

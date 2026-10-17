@@ -1121,6 +1121,15 @@ class Dashboard(QMainWindow):
                 QMessageBox.warning(self, "提示", f"分类「{name}」已存在。")
                 return
 
+            # 扩展名重叠校验（AW-11）：categorize_file 按分类顺序取**首个**匹配，
+            # 同一扩展名被两个分类声明时，文件会路由到「由顺序决定」的不确定分类。
+            # 判断逻辑抽成可单测的纯函数 extension_conflict_error，这里只负责展示与拦截。
+            from file_manager import extension_conflict_error
+            ext_err = extension_conflict_error(self.config["categories"], extensions)
+            if ext_err:
+                QMessageBox.warning(self, "提示", ext_err)
+                return
+
             # 子文件夹名越界校验（AW-3）：folder 来自自由文本，可能写成
             # ..\..\evil 之类把文件移出存储根目录的值。判断逻辑抽成可单测的
             # 纯函数 category_folder_error，这里只负责展示与拦截。
@@ -1188,6 +1197,16 @@ class Dashboard(QMainWindow):
         ]
         if not new_exts:
             QMessageBox.warning(self, "提示", "请至少保留一个扩展名。")
+            return
+
+        # 扩展名重叠校验（AW-11）：编辑时排除分类自身（按对象身份，因为同一操作里
+        # 分类名可能被改掉），只检查与**其它**分类是否重叠，重叠则拦截保存。
+        from file_manager import extension_conflict_error
+        ext_err = extension_conflict_error(
+            self.config["categories"], new_exts, exclude=cat
+        )
+        if ext_err:
+            QMessageBox.warning(self, "提示", ext_err)
             return
 
         old_name = cat["name"]

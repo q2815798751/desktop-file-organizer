@@ -1201,5 +1201,164 @@ class TestSafeSize(unittest.TestCase):
         self.assertFalse(isinstance(file_manager.SIZE_PLACEHOLDER, int))
 
 
+# ── 扩展名重叠检测（AW-11） ──────────────────────────────
+
+class TestExtensionConflicts(unittest.TestCase):
+    """纯函数 extension_conflicts 的判定（不碰文件系统）。"""
+
+    CATS = [
+        {"name": "办公文件", "extensions": ["doc", "docx", "pdf"], "folder": "办公文件"},
+        {"name": "图片", "extensions": ["png", "jpg"], "folder": "图片"},
+        {"name": "其他", "extensions": [], "folder": "其他"},
+    ]
+
+    def test_overlap_is_detected(self):
+        conflicts = file_manager.extension_conflicts(self.CATS, ["png", "mp4"])
+        self.assertEqual(conflicts, [("png", "图片")])
+
+    def test_no_overlap_passes(self):
+        self.assertEqual(
+            file_manager.extension_conflicts(self.CATS, ["mp4", "mov", "avi"]), []
+        )
+
+    def test_normalizes_case_leading_dot_and_spaces(self):
+        conflicts = file_manager.extension_conflicts(self.CATS, [" .PNG ", "JPG"])
+        self.assertEqual(conflicts, [("png", "图片"), ("jpg", "图片")])
+
+    def test_exclude_self_by_identity(self):
+        cat = self.CATS[1]  # 图片
+        # 编辑「图片」自身、扩展名不变 → 不与自己冲突
+        self.assertEqual(
+            file_manager.extension_conflicts(self.CATS, ["png", "jpg"], exclude=cat), []
+        )
+
+    def test_exclude_is_by_identity_not_equality(self):
+        # 传一个「内容相同但不同对象」的分类 → 不排除它，仍报冲突（身份语义）
+        clone = {"name": "图片", "extensions": ["png", "jpg"], "folder": "图片"}
+        self.assertEqual(
+            file_manager.extension_conflicts(self.CATS, ["png"], exclude=clone),
+            [("png", "图片")],
+        )
+
+    def test_exclude_self_still_conflicts_with_others(self):
+        cat = self.CATS[1]  # 图片
+        # 编辑「图片」，把扩展名改成也属于办公文件的 doc → 与办公文件冲突
+        self.assertEqual(
+            file_manager.extension_conflicts(self.CATS, ["png", "doc"], exclude=cat),
+            [("doc", "办公文件")],
+        )
+
+    def test_duplicate_within_input_reported_once(self):
+        # 输入里同一扩展名的多种写法只算一个（去重），且只报一次
+        self.assertEqual(
+            file_manager.extension_conflicts(self.CATS, ["png", "PNG", ".png"]),
+            [("png", "图片")],
+        )
+        # 没有任何分类声明这些扩展名 → 空
+        self.assertEqual(
+            file_manager.extension_conflicts(
+                [{"name": "X", "extensions": ["mp4"]}], ["png", "PNG", ".png"]
+            ),
+            [],
+        )
+
+    def test_reports_each_extension_once(self):
+        # 两个分类都声明 mp4 → 只报一次（首个声明它的分类）
+        cats = [
+            {"name": "A", "extensions": ["mp4"]},
+            {"name": "B", "extensions": ["mp4"]},
+        ]
+        self.assertEqual(
+            file_manager.extension_conflicts(cats, ["mp4"]), [("mp4", "A")]
+        )
+
+    def test_multiple_conflicts_follow_input_order(self):
+        conflicts = file_manager.extension_conflicts(self.CATS, ["mp4", "png", "doc"])
+        self.assertEqual(conflicts, [("png", "图片"), ("doc", "办公文件")])
+
+    def test_empty_input_and_empty_categories(self):
+        self.assertEqual(file_manager.extension_conflicts(self.CATS, []), [])
+        self.assertEqual(file_manager.extension_conflicts(self.CATS, None), [])
+        self.assertEqual(file_manager.extension_conflicts([], ["png"]), [])
+        self.assertEqual(file_manager.extension_conflicts(None, ["png"]), [])
+
+    def test_category_with_empty_extensions_never_conflicts(self):
+        self.assertEqual(
+            file_manager.extension_conflicts(self.CATS, ["exe", "dll"]), []
+        )
+
+    def test_non_string_extensions_are_ignored(self):
+        cats = [{"name": "怪", "extensions": [123, None, "png"]}]
+        self.assertEqual(
+            file_manager.extension_conflicts(cats, ["png"]), [("png", "怪")]
+        )
+        self.assertEqual(file_manager.extension_conflicts(cats, [123, None]), [])
+
+
+class TestExtensionConflictError(unittest.TestCase):
+    """extension_conflict_error 的用户可见文案（纯函数）。"""
+
+    CATS = TestExtensionConflicts.CATS
+
+    def test_overlap_returns_message_naming_ext_and_category(self):
+        msg = file_manager.extension_conflict_error(self.CATS, ["png"])
+        self.assertIsNotNone(msg)
+        self.assertIn("png", msg)
+        self.assertIn("图片", msg)
+
+    def test_no_overlap_returns_none(self):
+        self.assertIsNone(
+            file_manager.extension_conflict_error(self.CATS, ["mp4", "mov"])
+        )
+
+    def test_exclude_self_returns_none_when_only_self_would_conflict(self):
+        cat = self.CATS[1]
+        self.assertIsNone(
+            file_manager.extension_conflict_error(
+                self.CATS, ["png", "jpg"], exclude=cat
+            )
+        )
+
+    def test_message_lists_multiple_conflicts(self):
+        msg = file_manager.extension_conflict_error(self.CATS, ["png", "doc"])
+        self.assertIn("png", msg)
+        self.assertIn("doc", msg)
+        self.assertIn("图片", msg)
+        self.assertIn("办公文件", msg)
+
+
+class TestCategorizeFileOverlapIsOrderDependent(TempDirsMixin, unittest.TestCase):
+    """证明「重叠配置 → 首个匹配胜出」确实是顺序决定的（AW-11 的根因）。"""
+
+    def _cfg(self, cats):
+        return {
+            "desktop_path": self.desktop,
+            "storage_path": self.storage,
+            "categories": cats,
+        }
+
+    def test_first_declared_category_wins(self):
+        a = {"name": "甲", "extensions": ["png"], "folder": "甲"}
+        b = {"name": "乙", "extensions": ["png"], "folder": "乙"}
+        src = self.write_file(os.path.join(self.desktop, "x.png"), "d")
+        name, dest = file_manager.categorize_file(src, self._cfg([a, b]))
+        self.assertEqual(name, "甲")
+        self.assertEqual(os.path.dirname(dest), os.path.join(self.storage, "甲"))
+        self.assertInsideTmp(dest)
+
+    def test_order_flip_changes_destination(self):
+        a = {"name": "甲", "extensions": ["png"], "folder": "甲"}
+        b = {"name": "乙", "extensions": ["png"], "folder": "乙"}
+        src = self.write_file(os.path.join(self.desktop, "y.png"), "d")
+        name, dest = file_manager.categorize_file(src, self._cfg([b, a]))  # 顺序调换
+        self.assertEqual(name, "乙")
+        self.assertEqual(os.path.dirname(dest), os.path.join(self.storage, "乙"))
+
+    def test_detector_flags_this_exact_config(self):
+        a = {"name": "甲", "extensions": ["png"], "folder": "甲"}
+        b = {"name": "乙", "extensions": ["png"], "folder": "乙"}
+        self.assertIsNotNone(file_manager.extension_conflict_error([a, b], ["png"]))
+
+
 if __name__ == "__main__":
     unittest.main()
