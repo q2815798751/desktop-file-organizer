@@ -625,7 +625,7 @@
       且全部路径打桩到临时目录），未在真实桌面验证，仓库根目录未生成 `config.json`
       （`ls config.json` 显式确认不存在；`git status` 仅 2 个预期改动文件）。
 
-- [ ] **AW-21 给 restore_files 补 junction 复检 + 修测试的「安全承诺」假象（AW-6 复查实测）**
+- [x] **AW-21 给 restore_files 补 junction 复检 + 修测试的「安全承诺」假象（AW-6 复查实测）**
 
       AW-6 的对抗性复查确认「够格」（187 用例真绿、22 条真会红、无越界改动、
       `restore()` 执行层**有**覆盖——`trace` 显示 138-150/154 行全命中，
@@ -669,6 +669,65 @@
       `except ValueError`（88-89，真实触发路径是保留设备名如 `con`/`D:evil`——目前**零覆盖**）。
       顺手修 `resolve_desktop` 与 `file_manager.get_desktop_path` 的一致性表述
       （前者只在为空时回退、后者在目录不存在时也回退；fail-closed 但措辞夸大）。
+      ✅ 已完成（2026-10-17）：实际 **203** 个用例（187 → 203，净增 16 条，全在
+      `tests/test_restore_files.py`：`TestCategoryDir` 6 条 + `TestResolveDest` 4 条 +
+      `TestSetupGuard` 2 条 + `TestRestoreJunctionEscape` 1 条 +
+      `TestCategoryFolders` 1 条 + `TestBuildRestorePlan` 1 条 + `TestRestoreEndToEnd` 1 条），
+      `python -m unittest discover -s tests -v` 全绿（含真实 `mklink /J` 用例，**实跑非 skip**）。
+      - **(1) 🔴 junction 复检（怎么接的）**：`restore_files.py` 新增 `import file_manager`
+        + `logger`；`_category_dir` 在**词法校验之后**调
+        `escape = file_manager.realpath_escape_error(root_abs, target)`——
+        **直接复用 AW-19 的现成函数**，越界即 `logger.warning(...)` 后返回 `None`（可见降级，
+        不静默；顺带给绝对路径 / `..` / `ValueError` 三条既有跳过路径也补了 WARNING 日志）。
+        默认的 logging 会把 WARNING 打到 stderr，跑脚本的用户**看得见**。
+      - **(2) 测试安全护栏加固**：`RestoreTestBase.setUp` 现在 (a) `mock.patch.dict`
+        把 `HOME`/`USERPROFILE` 重定向到 `self.tmp`、(b) 把 `os.path.expanduser` 的 `~`
+        重定向到 `self.tmp`、(c) 追加**显式断言** `_assert_fallback_desktop_inside_tmp()`：
+        断言 `restore_files.resolve_desktop({})` 落在 `self.tmp` 内。**这才是安全承诺本身**——
+        打桩失效 / 回退桌面被改回 import 时绑定 → setUp **直接炸**，测试体根本不会跑。
+        docstring 里「即使修复被撤掉也不会碰到真实 `~/Desktop`」的**假承诺已改写**为
+        「打桩只是前提、护栏才是保证」，并在 `restore_files.py` 模块 docstring 写明
+        `mock.patch("config.CONFIG_PATH")` **只对「调用时读 config.CONFIG_PATH」的写法有效**
+        （改回本模块的模块级常量就会静默失效）。
+      - **(3) 去重按 abspath**：`category_folders` 的去重键由原始字符串改为
+        `os.path.abspath(folder)`，`shared` 与 `.\shared` 不再重复。
+      - **(4) 三处失败分支补覆盖**：`except OSError`（`restore()` 搬移失败：spy 掉包
+        `shutil.move` 抛 `OSError` → 断言打印「失败: a.png - boom」、`共恢复 0 个文件`、
+        源文件保留）；第二次改名冲突（`_resolve_dest` 在 `a.png` + `a_restored(1).png`
+        都被占时 → `a_restored(2).png`，另补第三条 → `a_restored(3)`）；
+        `except ValueError`（用保留设备名 `con`/`aux`/`nul` 与盘符相对路径 `D:evil`
+        触发 `commonpath` 的 `ValueError`——已实测 `abspath("con") == "\\.\con"`、
+        `abspath("D:evil") == "D:\evil"`）。顺手把 `resolve_desktop` 的 docstring 从
+        「与 `get_desktop_path` 的缺省行为一致」改为**如实**表述（缺省值相同、回退条件不同）。
+      反向验证（**四组定点破坏**，未用 `git checkout origin/master -- <文件>` 那种超集回退；
+      每组先 `git diff` / `grep BREAK` 确认破坏真的生效）：
+      (A) 把 `escape = file_manager.realpath_escape_error(...)` 改成 `escape = None` →
+          重跑得 **3 failed**，正是三条 junction 用例（`TestCategoryDir.test_real_junction_escape_is_skipped` /
+          `TestBuildRestorePlan.test_plan_skips_junction_category_pointing_outside` /
+          `TestRestoreJunctionEscape.test_restore_does_not_move_files_from_outside_junction`）；
+          最后一条的断言输出是 `['a.png', 'SECRET.txt'] != ['a.png']`，即**根外文件真的会被搬**
+          （spy 记录到，非推断；spy 只记录不真搬，红线内）。
+      (B) 去掉 `setUp` 里的 HOME/USERPROFILE + expanduser 两处重定向、**保留护栏** →
+          重跑得 **38 failed**（`tests/test_restore_files.py` 全部用例），断言输出是
+          `回退桌面 'C:\\Users\\sechen\\Desktop' 不在临时目录 'C:\\Users\\sechen\\AppData\\Local\\Temp\\tmpXXXX' 内
+          ——打桩已失效，继续跑会碰到真实桌面，立即中止`。
+          **这就是第 2 点的验收**：撤掉重定向后回退桌面确实是**真实桌面**，
+          但护栏在 `setUp` 阶段就炸、测试体一行都不跑，**不会真去动真实桌面**。
+      (C) 把去重键改回 `key = folder` → 重跑得 **1 failed**，正是
+          `test_dedupes_equivalent_spellings_by_abspath`。
+      (D) 三处分支一并破坏（`except OSError`→`except ValueError`、
+          `_category_dir` 的 `except ValueError`→`except TypeError`、
+          `_resolve_dest` 去掉循环内的存在性判断）→ 重跑得 **2 failed + 3 errors**，
+          正是 5 条对应用例（`test_restore_reports_move_failure_and_keeps_source` /
+          `test_reserved_device_name_hits_valueerror_branch` /
+          `test_drive_relative_path_hits_valueerror_branch` /
+          `test_second_conflict_increments_counter` / `test_third_conflict_increments_counter`）。
+      装回后 `grep BREAK` 0 命中、恢复 203 全绿。
+      全程 `tempfile.TemporaryDirectory()` + `mock.patch("config.CONFIG_PATH", 临时路径)`；
+      junction 在临时目录内建（`mklink /J`）、`os.rmdir` 删链接；`restore()` 的搬移调用用
+      **记录型 spy 掉包 `shutil.move`（只记录、不真搬）**；未运行 `main.py` / `restore_files.py`
+      的 `__main__` 入口，未在真实桌面验证，仓库根目录未生成 `config.json`
+      （`ls config.json` 显式确认不存在；`git status` 仅 2 个预期改动文件）。
 
 - [ ] **AW-7 修文件监控搬走「半成品」（健壮性，但有真实数据风险）**
       问题：`file_watcher.py:32,66-85` 防抖只有 500ms 且**不判断文件是否写完**，
