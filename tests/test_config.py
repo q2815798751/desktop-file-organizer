@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 
@@ -431,6 +432,125 @@ class TestDefaultConfigIsolation(ConfigTestBase):
 
         self._assert_default_unchanged(snapshot)
         self.assertEqual(len(config.DEFAULT_CONFIG["categories"]), 5, "默认分类数量不得被改动")
+
+
+# ── AW-12：开机自启的 pywin32 降级行为 ───────────────────────
+# README「环境要求」里写明：未安装可选的 pywin32 时，开机自启会降级成启动文件夹里的
+# .bat（仍可用，只是登录时闪现控制台窗口）。这里把这条**被文档承诺的行为**钉住——
+# 否则文档一旦与代码漂移，没人会发现（正是 AW-12 要修的那类「文档与实物不一致」）。
+#
+# ⚠️ STARTUP_LNK 在非打包状态下指向**真实的** %APPDATA%\...\Startup，
+#    所以本类在 setUp 里把它打桩到临时目录，**绝不真的创建开机自启快捷方式**。
+
+class AutoStartTestBase(ConfigTestBase):
+    """把启动文件夹路径打桩到临时目录。"""
+
+    def setUp(self):
+        super().setUp()
+        self.startup_lnk = os.path.join(self.tmp, "DesktopOrganizer.lnk")
+        patcher = mock.patch("config.STARTUP_LNK", self.startup_lnk)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @property
+    def startup_bat(self):
+        return self.startup_lnk.replace(".lnk", ".bat")
+
+    def assert_paths_inside_tmp(self):
+        """护栏：任何启动路径落到临时目录外就立即中止（红线：不碰真实启动文件夹）。"""
+        for p in (self.startup_lnk, self.startup_bat):
+            self.assertTrue(
+                os.path.abspath(p).startswith(os.path.abspath(self.tmp) + os.sep),
+                f"启动路径 {p} 不在临时目录 {self.tmp} 内，拒绝继续（会碰到真实启动文件夹）",
+            )
+
+
+class TestAutoStartFallback(AutoStartTestBase):
+    """没有 pywin32 时降级写 .bat（README 描述的行为）。"""
+
+    def _without_pywin32(self):
+        # sys.modules 里放 None → `import pythoncom` 抛 ImportError（本机已装 pywin32，
+        # 必须这样屏蔽掉，才能测降级分支）。
+        return mock.patch.dict(
+            sys.modules,
+            {"pythoncom": None, "win32com": None, "win32com.client": None},
+        )
+
+    def test_missing_pywin32_falls_back_to_bat(self):
+        self.assert_paths_inside_tmp()
+        with self._without_pywin32():
+            config._create_startup_shortcut()
+
+        self.assertTrue(os.path.exists(self.startup_bat), "缺失 pywin32 时应写出 .bat")
+        self.assertFalse(os.path.exists(self.startup_lnk), "缺失 pywin32 时不应有 .lnk")
+        with open(self.startup_bat, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn(sys.executable, content)
+        self.assertIn("main.py", content)
+
+    def test_get_auto_start_detects_bat(self):
+        # 降级产物（.bat）也必须被算作「已开启自启」，否则托盘勾选状态会错。
+        self.assert_paths_inside_tmp()
+        with open(self.startup_bat, "w", encoding="utf-8") as f:
+            f.write("@echo off\n")
+        self.assertTrue(config.get_auto_start())
+
+    def test_get_auto_start_false_when_neither_exists(self):
+        self.assert_paths_inside_tmp()
+        self.assertFalse(config.get_auto_start())
+
+    def test_set_auto_start_false_removes_bat_and_lnk(self):
+        self.assert_paths_inside_tmp()
+        for p in (self.startup_lnk, self.startup_bat):
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("x")
+        config.set_auto_start(False)
+        self.assertFalse(os.path.exists(self.startup_lnk))
+        self.assertFalse(os.path.exists(self.startup_bat))
+
+
+class TestAutoStartWithPywin32(AutoStartTestBase):
+    """装了 pywin32 时走 .lnk 分支（注入假模块，不碰真实 COM / 注册表 / 启动文件夹）。"""
+
+    def test_uses_lnk_when_pywin32_available(self):
+        self.assert_paths_inside_tmp()
+        calls = []
+
+        pythoncom = types.ModuleType("pythoncom")
+        pythoncom.CoInitialize = lambda: calls.append("init")
+        pythoncom.CoUninitialize = lambda: calls.append("uninit")
+
+        win32com = types.ModuleType("win32com")
+        client = types.ModuleType("win32com.client")
+
+        class _Shortcut:
+            def __init__(self, path):
+                self._path = path
+
+            def Save(self):
+                with open(self._path, "w", encoding="utf-8") as f:
+                    f.write("fake lnk")
+
+        class _Shell:
+            def CreateShortCut(self, path):
+                calls.append(("cut", path))
+                return _Shortcut(path)
+
+        client.Dispatch = lambda progid: calls.append(("dispatch", progid)) or _Shell()
+        win32com.client = client
+
+        with mock.patch.dict(
+            sys.modules,
+            {"pythoncom": pythoncom, "win32com": win32com, "win32com.client": client},
+        ):
+            config._create_startup_shortcut()
+
+        self.assertIn("init", calls)
+        self.assertIn("uninit", calls)
+        self.assertIn(("dispatch", "WScript.Shell"), calls)
+        self.assertIn(("cut", self.startup_lnk), calls)  # 目标正是 .lnk 路径
+        self.assertTrue(os.path.exists(self.startup_lnk), "装了 pywin32 时应创建 .lnk")
+        self.assertFalse(os.path.exists(self.startup_bat), "装了 pywin32 时不应再写 .bat")
 
 
 if __name__ == "__main__":

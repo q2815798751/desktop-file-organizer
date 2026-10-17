@@ -23,7 +23,10 @@
 
 - Windows 10 / 11（依赖 Win32 API，仅支持 Windows）
 - Python 3.9+（开发环境为 3.14）
-- 依赖：`PyQt5`、`watchdog`
+- 依赖：`PyQt5`、`watchdog`（必需）；`pywin32`（**可选**，见下）
+  - `pywin32` 只用于把「开机自启」创建成启动文件夹里的 `.lnk` 快捷方式。**未安装时 `config.py`
+    会自动降级**：改为在启动文件夹写一个 `.bat`，开机自启仍可用，只是登录时会闪现一个控制台
+    窗口。核心的桌面整理功能不依赖它，所以没写进 `requirements.txt`（仅以注释标注为可选依赖）。
 
 ## 安装
 
@@ -55,11 +58,15 @@ pip install pyinstaller
 python -m PyInstaller --onefile --windowed --name DesktopFileOrganizer --icon app_icon.ico main.py
 ```
 
-产物为单个 `dist/DesktopFileOrganizer.exe`（约 38 MB）。本仓库同时提供：
+产物为单个 `dist/DesktopFileOrganizer.exe`（约 38 MB）。**注意**：`dist/`、`build/`、`*.spec`、
+`*.lnk` 都被 `.gitignore` 忽略，构建产物与本机快捷方式**不随仓库分发**，需要自己生成：
 
-- 项目根目录快捷方式 `桌面文件收纳.lnk` → 指向该 exe，双击即可打开（图标用 `app_icon.ico`）。
-- 便携安装包 `dist/DesktopFileOrganizer-安装包.zip`（含 exe 与使用说明，解压即用；不含本机 `config.json`）。
-- Inno Setup 安装程序 `dist/DesktopFileOrganizer-安装程序.exe`（安装向导 + 开始菜单/桌面快捷方式 + 卸载项；安装到用户目录，免管理员）。脚本见 `installer/DesktopFileOrganizer.iss`，编译：`ISCC.exe installer\DesktopFileOrganizer.iss`。
+- Inno Setup 安装程序 `DesktopFileOrganizer-安装程序.exe`（安装向导 + 开始菜单/桌面快捷方式 + 卸载项；安装到用户目录，免管理员）由本地编译产出到 `dist/`；便携安装包（含 exe 与使用说明，解压即用；不含本机 `config.json`）同样需本地打包。
+- 项目根目录快捷方式 `桌面文件收纳.lnk` → 指向该 exe，双击即可打开（图标用 `app_icon.ico`）。该快捷方式属**本机自建**（`*.lnk` 被 `.gitignore` 忽略），不会出现在克隆下来的仓库里。
+
+仓库实际跟踪的是打包**脚本**，不是二进制产物：Inno Setup 脚本 `installer/DesktopFileOrganizer.iss`
+（编译：`ISCC.exe installer\DesktopFileOrganizer.iss`，需先构建出 `dist/DesktopFileOrganizer.exe`）
+与 `installer/使用说明.txt`。
 
 > 注：PyInstaller 单文件版偶被部分杀毒软件误报。打包时若需规避，可改用 `--onedir`（产物在 `dist/DesktopFileOrganizer/`）。
 
