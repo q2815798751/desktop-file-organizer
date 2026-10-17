@@ -338,7 +338,7 @@
       全程 `tempfile.TemporaryDirectory()` + `mock.patch("config.CONFIG_PATH", 临时路径)`，
       未在真实桌面验证，仓库根目录未生成 `config.json`。
 
-- [ ] **AW-18 修 `(None,None)` 被当成功 + 清掉 AW-17 留下的过时 docstring（正确性 + 打磨）**
+- [x] **AW-18 修 `(None,None)` 被当成功 + 清掉 AW-17 留下的过时 docstring（正确性 + 打磨）**
 
       三件事，都来自 AW-17 的对抗性复查（该复查已确认 AW-17 够格、所有权声明真正闭合、
       且「新窗口」之说是假警报——新旧窗口边界与宽度相同，只是把 makedirs 从 copytree
@@ -356,6 +356,30 @@
          这处漏网的顺手补上。
       3. 模块 docstring 里「POSIX 下空目录被替换会丢数据」措辞略强——空目录被替换**没有数据可丢**
          （只是 no-clobber 被破坏）。改准确。
+      ✅ 已完成（2026-10-17）：实际 **110** 个用例（102 → 110，净增 8 条，全在
+      `tests/test_file_manager.py`：`TestDidMove` 5 条 + `TestCallersCountMovesCorrectly` 3 条），
+      `python -m unittest discover -s tests -v` 全绿。
+      - **(1) 怎么让它可验证（GUI 不能 import）**：把判定逻辑抽成 `file_manager.did_move(result)`
+        ——**纯函数**，`file_manager.py` 无 PyQt5 依赖、可直接 import，故可单测。
+        它判的是 `result[1] is not None`（返回值里的 dest），**不判元组本身**，公开 2 元组契约不变。
+        `dashboard.py` / `desktop_panel.py` 的拖拽计数改为
+        `if p and did_move(move_into_category(...))`（各加一行注释点明陷阱）。
+        `categorize_file` 的调用方只有 `file_watcher.py:79`，它本就写 `if cat_name:`（判元素、
+        非判元组），**无此 bug，未改**。新增用例含「纯函数判定」与「端到端复刻调用方计数」
+        两层：让 `shutil.move` 抛 OSError → 断言 `did_move` 为假、且调用方计数为 0（不误算成功）。
+      - **(2)** `_cleanup_partial` docstring 改写：所有权证据来自 `_move_dir_no_clobber` 里
+        **我们自己的 `os.makedirs(dest)`**（`exist_ok=False`），`copytree` 随后用
+        `dirs_exist_ok=True` 往里拷；目标已存在时 `makedirs` 抛 `FileExistsError`、那不是我们的、绝不清。
+      - **(3)** 模块 docstring 改为：POSIX 下**文件**被静默覆盖**真的会丢数据**；
+        **空目录**被替换只是破坏 no-clobber（没有数据可丢）。
+      反向验证（**定点**，未用 `git checkout origin/master -- file_manager.py` 那种超集回退）：
+      只把 `did_move` 的函数体改回旧的 buggy 写法 `return bool(result)`，
+      `git diff -- file_manager.py` 确认 `BREAK` 标记已生效（`grep BREAK` 命中）
+      → 重跑得 **3 failed**，正是三条判别性用例（`TestDidMove.test_failure_tuple_is_not_a_move`
+      + `TestCallersCountMovesCorrectly` 的 `test_failed_move_into_category_not_counted` /
+      `test_failed_categorize_not_counted`）；装回修复、`grep BREAK` 0 命中后恢复 110 全绿。
+      全程未 import GUI 模块（`dashboard.py` / `desktop_panel.py` 仅 `py_compile` 静态检查）、
+      未在真实桌面验证，仓库根目录未生成 `config.json`（`git status` 仅 4 个预期改动文件）。
 
 - [ ] **AW-3 修分类 `folder` 字段的路径越界（数据安全）**
       问题：`file_manager.py:30-33` 直接 `os.path.join(storage_root, folder)`，
