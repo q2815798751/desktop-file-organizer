@@ -1,6 +1,7 @@
 """
 配置管理模块 — 读写 config.json，管理分类规则和面板状态。
 """
+import copy
 import json
 import os
 import shutil
@@ -59,11 +60,17 @@ def _get_default_desktop():
 
 
 def _default_config():
-    """构造一份默认配置（补齐 desktop_path，复制 categories 外层字典）。"""
-    cfg = dict(DEFAULT_CONFIG)
+    """构造一份默认配置（补齐 desktop_path）。
+
+    **深拷贝** DEFAULT_CONFIG：旧实现用 `dict(DEFAULT_CONFIG)` 只浅拷贝顶层，
+    再 `[dict(c) for c in ...]` 只浅拷贝每个分类字典的外层，于是
+    `categories[i]["subtypes"]` / `["extensions"]` 仍与模块级 DEFAULT_CONFIG
+    **共享引用**。运行时对返回配置做原地修改（append 扩展名、往 subtypes 里
+    加子类型）会**永久污染** DEFAULT_CONFIG，「恢复默认」拿到的就是被改过的配置。
+    deepcopy 一次性切断所有内层引用。
+    """
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
     cfg["desktop_path"] = _get_default_desktop()
-    # copy categories（浅拷贝外层，保持既有行为）
-    cfg["categories"] = [dict(c) for c in DEFAULT_CONFIG["categories"]]
     return cfg
 
 
@@ -128,10 +135,12 @@ def load_config():
             cfg = None
 
         if isinstance(cfg, dict):
-            # 补全缺失的默认字段
+            # 补全缺失的默认字段。deepcopy 而非直接赋值：否则缺 "categories" 时
+            # 会把 DEFAULT_CONFIG 里那份**共享引用**塞进 cfg，运行时原地修改
+            # cfg["categories"]（增删分类/扩展名）就会污染模块级默认值。
             for key, val in DEFAULT_CONFIG.items():
                 if key not in cfg:
-                    cfg[key] = val
+                    cfg[key] = copy.deepcopy(val)
             if not cfg.get("desktop_path"):
                 cfg["desktop_path"] = _get_default_desktop()
             return cfg

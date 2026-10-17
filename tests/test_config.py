@@ -8,6 +8,7 @@ config.py 读写配置的单元测试（标准库 unittest，零新依赖）。
 
 运行：python -m unittest discover -s tests -v
 """
+import copy
 import json
 import os
 import sys
@@ -354,6 +355,82 @@ class TestCorruptConfigDoesNotTriggerSecondMove(ConfigTestBase):
         self.assertTrue(os.path.isfile(moved), "首次运行必须把匹配文件搬进分类文件夹")
         self.assertFalse(os.path.exists(src), "首次运行后桌面上不应再有源文件")
         self.assertTrue(os.path.abspath(moved).startswith(self.tmp))
+
+
+# ── AW-10：返回的配置不得与模块级 DEFAULT_CONFIG 共享内层引用 ──
+#
+# 旧实现 `_default_config` 只做浅拷贝：`dict(DEFAULT_CONFIG)` 浅拷贝顶层，
+# `[dict(c) for c in ...]` 浅拷贝每个分类字典的外层，于是
+# categories[i]["subtypes"] / ["extensions"] 仍与 DEFAULT_CONFIG 共享引用。
+# 运行时原地修改（append 扩展名、往 subtypes 加子类型）会永久污染
+# DEFAULT_CONFIG，「恢复默认」拿到的是被改过的配置。
+
+class TestDefaultConfigIsolation(ConfigTestBase):
+
+    def _assert_default_unchanged(self, snapshot):
+        self.assertEqual(
+            config.DEFAULT_CONFIG, snapshot,
+            "对返回配置的原地修改不得污染模块级 DEFAULT_CONFIG",
+        )
+
+    def test_returned_config_does_not_share_subtypes_with_default(self):
+        cfg = config.load_config()
+        self.assertIsNot(
+            cfg["categories"][0]["subtypes"],
+            config.DEFAULT_CONFIG["categories"][0]["subtypes"],
+            "subtypes 必须是深拷贝，不能与 DEFAULT_CONFIG 共享引用",
+        )
+        self.assertIsNot(
+            cfg["categories"][0]["extensions"],
+            config.DEFAULT_CONFIG["categories"][0]["extensions"],
+            "extensions 必须是深拷贝，不能与 DEFAULT_CONFIG 共享引用",
+        )
+
+    def test_in_place_subtype_mutation_does_not_pollute_default(self):
+        snapshot = copy.deepcopy(config.DEFAULT_CONFIG)
+        cfg = config.load_config()
+        subtypes = cfg["categories"][0]["subtypes"]
+        # 原地改内层：既有子类型追加 + 新增子类型键
+        subtypes["Word文档"].append("POLLUTED")
+        subtypes["注入的子类型"] = ["zzz"]
+        cfg["categories"][0]["extensions"].append("POLLUTED_EXT")
+
+        self._assert_default_unchanged(snapshot)
+        self.assertNotIn("POLLUTED", config.DEFAULT_CONFIG["categories"][0]["subtypes"]["Word文档"])
+        self.assertNotIn("注入的子类型", config.DEFAULT_CONFIG["categories"][0]["subtypes"])
+
+    def test_reload_after_in_place_mutation_returns_clean_default(self):
+        # 模拟「恢复默认」：删掉配置后重新 load_config 应拿到**干净**的默认值。
+        cfg = config.load_config()
+        cfg["categories"][0]["subtypes"]["Word文档"].append("POLLUTED")
+        cfg["categories"][0]["subtypes"]["注入的子类型"] = ["zzz"]
+
+        os.remove(self.config_path)
+        fresh = config.load_config()
+
+        self.assertNotIn("POLLUTED", fresh["categories"][0]["subtypes"]["Word文档"])
+        self.assertNotIn("注入的子类型", fresh["categories"][0]["subtypes"])
+        self.assertEqual(
+            fresh["categories"][0]["subtypes"],
+            config.DEFAULT_CONFIG["categories"][0]["subtypes"],
+        )
+
+    def test_missing_key_fill_does_not_share_default_references(self):
+        # 配置文件存在但缺 "categories" → 补默认值时也不能共享引用
+        self.write_raw(json.dumps({"initialized": True}))
+        snapshot = copy.deepcopy(config.DEFAULT_CONFIG)
+        cfg = config.load_config()
+
+        self.assertIsNot(cfg["categories"], config.DEFAULT_CONFIG["categories"])
+        self.assertIsNot(
+            cfg["categories"][0]["subtypes"],
+            config.DEFAULT_CONFIG["categories"][0]["subtypes"],
+        )
+        cfg["categories"].append({"name": "新分类", "extensions": ["x"], "folder": "新分类"})
+        cfg["categories"][0]["subtypes"]["Word文档"].append("POLLUTED")
+
+        self._assert_default_unchanged(snapshot)
+        self.assertEqual(len(config.DEFAULT_CONFIG["categories"]), 5, "默认分类数量不得被改动")
 
 
 if __name__ == "__main__":
