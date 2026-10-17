@@ -630,6 +630,53 @@ def _move_no_clobber(src, folder, filename):
     )
 
 
+# ── 回收站删除（Windows Shell FileOperation） ─────────────
+#
+# `SHFileOperationW` 的 `fFlags` 是 `FOF_*` 位掩码。旧实现（dashboard.py）
+# 错把 `SHEmptyRecycleBin` 的 `SHERB_*` 常量（NOCONFIRMATION=0x1 /
+# NOPROGRESSUI=0x2 / NOSOUND=0x4）当成 `FOF_*` 用，于是真正想要的
+# `FOF_NOCONFIRMATION`(0x10) 根本没被设上 → 系统照旧弹确认框。
+# 这里改用正确的 `FOF_*` 常量，并把「标志位」与「结果判定」抽成纯函数，
+# 以便在不调用真实 `SHFileOperation`（会真删文件）的前提下单测。
+
+FOF_SILENT = 0x0004
+FOF_NOCONFIRMATION = 0x0010
+FOF_ALLOWUNDO = 0x0040
+FOF_NOERRORUI = 0x0400
+
+
+def build_delete_flags():
+    """
+    纯函数：`SHFileOperationW(FO_DELETE)` 要用的 `fFlags`。
+
+    - `FOF_ALLOWUNDO`：删除进**回收站**（可撤销），而不是永久删除；
+    - `FOF_NOCONFIRMATION`：不弹「确实要删除吗」确认框；
+    - `FOF_NOERRORUI`：出错不弹系统错误框（由调用方自己处理并提示用户）；
+    - `FOF_SILENT`：不显示进度对话框。
+
+    ⚠️ 回归点：旧代码错把 `SHEmptyRecycleBin` 的 `SHERB_*`（0x1/0x2/0x4）
+    当成 `FOF_*` 用，**漏掉了 `FOF_NOCONFIRMATION`(0x10)**，于是确认框照弹。
+    本函数保证 0x10 一定在里面（见 tests/test_file_manager.py）。
+    """
+    return FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
+
+
+def interpret_delete_result(result, aborted):
+    """
+    纯函数：把 `SHFileOperationW` 的返回值与 `fAnyOperationsAborted` 翻译成
+    「这次删除**真的成功了**吗」（True / False）。
+
+    - `result`：API 返回值，0 表示函数层面没有报错；
+    - `aborted`：`SHFILEOPSTRUCTW.fAnyOperationsAborted`，**用户在确认框上点了
+      「取消」**时为真（ctypes 的 `BOOL` 就是 `c_int`，非 0 即真）。
+
+    ⚠️ 回归点：只看 `result == 0` 是不够的——用户点「取消」时 `SHFileOperationW`
+    仍返回 0，但**文件一个都没删**。旧代码据此把「取消」也算成删除成功
+    （界面显示删了、实际没删）。所以必须同时要求 `not aborted`。
+    """
+    return result == 0 and not aborted
+
+
 # ── 桌面图标排列 ─────────────────────────────────────────
 
 def arrange_desktop_icons():

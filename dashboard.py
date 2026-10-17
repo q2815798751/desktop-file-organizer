@@ -1488,9 +1488,10 @@ class Dashboard(QMainWindow):
         deleted = 0
         for fp in paths:
             try:
-                # 移入回收站而非永久删除
-                _send_to_recycle_bin(fp)
-                deleted += 1
+                # 移入回收站而非永久删除；返回 False 表示用户点了「取消」，
+                # 此时文件没被删，绝不能计入成功数（旧代码只看 result==0 会误算）。
+                if _send_to_recycle_bin(fp):
+                    deleted += 1
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"删除失败：{fp}\n{e}")
 
@@ -1625,13 +1626,18 @@ class Dashboard(QMainWindow):
 
 
 def _send_to_recycle_bin(file_path):
-    """将文件移入 Windows 回收站。"""
+    """
+    将文件移入 Windows 回收站。返回 True 表示**确实移入成功**。
+
+    用户点了「取消」时返回 False（此时 `SHFileOperationW` 仍返回 0，
+    必须靠 `fAnyOperationsAborted` 区分，否则会把「取消」当成删除成功、
+    界面显示删了实际没删）；真正的 API 错误仍抛 OSError。
+
+    标志位与结果判定都抽到了 file_manager 的纯函数里（可单测）。
+    """
     import ctypes
     from ctypes import wintypes
-
-    SHERB_NOCONFIRMATION = 0x00000001
-    SHERB_NOPROGRESSUI = 0x00000002
-    SHERB_NOSOUND = 0x00000004
+    from file_manager import build_delete_flags, interpret_delete_result
 
     # 需要双终止符
     class SHFILEOPSTRUCTW(ctypes.Structure):
@@ -1647,20 +1653,18 @@ def _send_to_recycle_bin(file_path):
         ]
 
     FO_DELETE = 3
-    FOF_ALLOWUNDO = 0x40
 
     shfile = SHFILEOPSTRUCTW()
     shfile.hwnd = None
     shfile.wFunc = FO_DELETE
     shfile.pFrom = file_path + "\0\0"
     shfile.pTo = None
-    shfile.fFlags = (
-        FOF_ALLOWUNDO
-        | SHERB_NOCONFIRMATION
-        | SHERB_NOPROGRESSUI
-        | SHERB_NOSOUND
-    )
+    shfile.fFlags = build_delete_flags()
 
     result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(shfile))
-    if result != 0:
+    if not interpret_delete_result(result, shfile.fAnyOperationsAborted):
+        if shfile.fAnyOperationsAborted:
+            # 用户主动取消：不算错误，只是没删，别计入成功数。
+            return False
         raise OSError(f"SHFileOperation failed with code {result}")
+    return True

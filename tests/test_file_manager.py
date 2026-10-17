@@ -802,5 +802,86 @@ class TestCallersCountMovesCorrectly(TempDirsMixin, unittest.TestCase):
         self.assertTrue(os.path.exists(src), "失败时源文件必须保留")
 
 
+# ── AW-5：回收站删除的标志位与结果判定 ─────────────────────
+#
+# 旧 GUI 代码把 SHEmptyRecycleBin 的 SHERB_* 常量当成 FOF_* 用，漏掉了
+# FOF_NOCONFIRMATION(0x10)（确认框照弹）；且从不检查 fAnyOperationsAborted，
+# 用户点「取消」时 result==0 仍被当成删除成功。这两点被抽成纯函数以便单测——
+# 测试**不调用**真实 SHFileOperation（那会真删文件）。
+
+# 旧代码误用的 SHEmptyRecycleBin 标志（NOCONFIRMATION / NOPROGRESSUI / NOSOUND）
+_SHERB_FLAGS_OLD = 0x0001 | 0x0002 | 0x0004
+
+
+class TestBuildDeleteFlags(unittest.TestCase):
+    """build_delete_flags 的纯逻辑：必须用正确的 FOF_* 组合。"""
+
+    def test_all_four_required_flags_set(self):
+        flags = file_manager.build_delete_flags()
+        self.assertTrue(flags & 0x0040, "缺少 FOF_ALLOWUNDO(0x40)：会变成永久删除")
+        self.assertTrue(flags & 0x0010, "缺少 FOF_NOCONFIRMATION(0x10)")
+        self.assertTrue(flags & 0x0400, "缺少 FOF_NOERRORUI(0x400)")
+        self.assertTrue(flags & 0x0004, "缺少 FOF_SILENT(0x4)")
+
+    def test_noconfirmation_bit_is_present_the_regression(self):
+        # 判别性：旧写法（SHERB_*）恰好没有 0x10，所以确认框照弹。
+        self.assertTrue(file_manager.build_delete_flags() & 0x0010)
+        self.assertFalse(_SHERB_FLAGS_OLD & 0x0010)
+
+    def test_exact_value(self):
+        # 0x40 | 0x10 | 0x400 | 0x4 == 0x454
+        self.assertEqual(file_manager.build_delete_flags(), 0x0454)
+
+    def test_is_not_the_old_shemptyrecyclebin_flags(self):
+        self.assertNotEqual(file_manager.build_delete_flags(), _SHERB_FLAGS_OLD)
+
+
+class TestInterpretDeleteResult(unittest.TestCase):
+    """interpret_delete_result 的纯逻辑：只有 result==0 且未被取消才算成功。"""
+
+    def test_success_is_true(self):
+        self.assertTrue(file_manager.interpret_delete_result(0, False))
+
+    def test_cancelled_is_not_success_the_regression(self):
+        # 用户点「取消」：API 仍返回 0，但文件没删 → 绝不能算成功。
+        self.assertFalse(file_manager.interpret_delete_result(0, True))
+
+    def test_nonzero_result_is_failure(self):
+        self.assertFalse(file_manager.interpret_delete_result(5, False))
+
+    def test_nonzero_result_and_cancelled_is_failure(self):
+        self.assertFalse(file_manager.interpret_delete_result(5, True))
+
+    def test_aborted_accepts_ctypes_bool_int(self):
+        # fAnyOperationsAborted 是 ctypes 的 BOOL（c_int）：0 为假、非 0 为真。
+        self.assertTrue(file_manager.interpret_delete_result(0, 0))
+        self.assertFalse(file_manager.interpret_delete_result(0, 1))
+        self.assertFalse(file_manager.interpret_delete_result(0, 12345))
+
+
+class TestDeleteResultCounting(unittest.TestCase):
+    """复刻 dashboard._on_delete_files 的计数写法：被取消的不计入成功数。"""
+
+    @staticmethod
+    def _count_deleted(pairs):
+        deleted = 0
+        for result, aborted in pairs:
+            if file_manager.interpret_delete_result(result, aborted):
+                deleted += 1
+        return deleted
+
+    def test_cancelled_delete_not_counted(self):
+        self.assertEqual(self._count_deleted([(0, True)]), 0)
+
+    def test_only_real_deletes_counted(self):
+        # 成功 + 取消 + 真失败 → 只算 1 个成功
+        self.assertEqual(
+            self._count_deleted([(0, False), (0, True), (1, False)]), 1
+        )
+
+    def test_all_success_counted(self):
+        self.assertEqual(self._count_deleted([(0, False), (0, 0)]), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
