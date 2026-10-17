@@ -923,7 +923,7 @@
       未运行 `main.py` / `restore_files.py`，未在真实桌面验证，仓库根目录未生成
       `config.json`（`ls config.json` 显式确认不存在；`git status` 仅 2 个预期改动文件）。
 
-- [ ] **AW-11 新建/编辑分类时校验扩展名重叠（正确性）**
+- [x] **AW-11 新建/编辑分类时校验扩展名重叠（正确性）**
       问题：`dashboard.py:1108-1122` / `1171-1181` 不检查扩展名是否与其他分类重叠，
       而 `categorize_file`（`file_manager.py:78-91`）按列表顺序取**首个**匹配，
       同一个扩展名被两个分类声明时，文件会路由到顺序决定的不确定分类。
@@ -931,6 +931,50 @@
       **行为变更点**：如果原设计是允许重叠的，这里属于产品决策 → 先读代码判断，
       拿不准就记到「待确认」而不要擅自改交互。
       新增用例：重叠 → 检测出冲突；不重叠 → 通过。
+      ✅ 已完成（2026-10-17）：实际 **265** 个用例（246 → 265，净增 19 条，全在
+      `tests/test_file_manager.py`：`TestExtensionConflicts` 12 条 +
+      `TestExtensionConflictError` 4 条 + `TestCategorizeFileOverlapIsOrderDependent` 3 条），
+      `python -m unittest discover -s tests -v` 全绿。
+      - **原设计意图判定：允许重叠并非设计意图**（故按「禁止并拦截」处理，非产品决策）。
+        依据：(1) 全仓无任何注释/文档提到重叠是特性或存在「优先级」概念
+        （`grep 重叠|优先|首个|priority` 仅命中本条目自身）；
+        (2) `config.py` 的 `DEFAULT_CONFIG` 五个默认分类之间**零重叠**；
+        (3) `categorize_file` / `_move_matching_files` 的「首个匹配」只是
+        「遍历到就返回」的自然写法，**没有 UI 能调整分类顺序来表达优先级**；
+        (4) 仓库既有模式就是「保存前拦截歧义配置」——`_on_add_category` 已有
+        分类重名检查、`_on_edit_category` 已有改名冲突检查、AW-3 已有 folder 越界拦截。
+        所以「扩展名重叠」是与这些同类的配置歧义，检测并拦截属正确性修复。
+      - **判定规则**（纯函数，`file_manager.py`）：`extension_conflicts(categories,
+        extensions, exclude=None)` 返回 `[(扩展名, 冲突分类名), ...]`（按输入顺序、去重、
+        每个扩展名只报**首个**声明它的分类）；`extension_conflict_error(...)` 返回
+        `None` 或一句中文提示。归一化用 `_normalize_ext`：小写、去首尾空白、去前导点，
+        非字符串忽略。`exclude` 按**对象身份**排除（编辑时传分类对象本身，因为同一操作里
+        分类名可能被改掉，按名字会排除错）。空输入/空分类/扩展名为空 → 无冲突。
+      - **GUI 接线**（`dashboard.py`，未 import、仅 `py_compile`）：`_on_add_category`
+        在重名检查之后、`_on_edit_category` 在拿到 `new_exts` 之后，各调
+        `extension_conflict_error(...)`，有冲突即 `QMessageBox.warning` 并 `return`
+        **阻止保存**（与 AW-3 的 folder 校验同样的「校验→提示→阻止」模式）。
+      - `categorize_file` 本身**未改**（仍是首个匹配）——检测在**配置产生**的入口拦截，
+        避免造出歧义配置；手工编辑 `config.json` 造出的旧重叠配置仍按顺序路由（未加启动期告警，
+        保持本项范围最小）。
+      - 新增 19 条用例覆盖：重叠被检出 / 不重叠通过 / 大小写+前导点+空白归一化 /
+        `exclude` 自身不冲突 / `exclude` 按身份而非相等 / `exclude` 自身仍与其它分类冲突 /
+        输入内重复只报一次 / 同一扩展名被两个分类声明只报首个 / 多冲突按输入顺序 /
+        空输入与空分类 / 空扩展名分类不冲突 / 非字符串扩展名忽略 / 文案含扩展名与分类名 /
+        无冲突返回 None / 文案列出多冲突；另 3 条**端到端**用例用真实临时目录证明
+        「甲/乙都声明 png → 首个声明的分类胜出」「调换顺序目的地随之改变」，
+        即顺序决定路由（AW-11 的根因），并断言检测器能标出这份配置。
+      反向验证（**定点破坏**，未用 `git checkout origin/master -- <文件>` 那种超集回退）：
+      把 `extension_conflicts` 的判据改成 `if n in cat_exts and False:  # BREAK-AW11`
+      （永不报冲突），`git diff -- file_manager.py` 确认 `BREAK-AW11` 已生效
+      → 重跑得 **10 failed + 1 error**，正是 11 条断言「检出冲突」的用例
+      （`TestExtensionConflicts` 8 条 + `TestExtensionConflictError` 2 条 +
+      `TestCategorizeFileOverlapIsOrderDependent.test_detector_flags_this_exact_config`）；
+      「不重叠/排除自身 → 无冲突」等负向用例仍绿（符合预期）。
+      装回修复、`grep BREAK` 0 命中后恢复 265 全绿。
+      全程 `tempfile.TemporaryDirectory()` 造目录、config 字典指向临时路径，
+      未运行 `main.py` / `restore_files.py`，未在真实桌面验证，仓库根目录未生成 `config.json`
+      （`ls config.json` 显式确认不存在；`git status` 仅 3 个预期改动文件）。
 
 - [ ] **AW-12 补 `requirements.txt` 与文档不一致（打磨）**
       问题：`config.py:106-119` 用 `pythoncom` / `win32com.client` 创建开机自启快捷方式，
@@ -1010,6 +1054,11 @@
   如果你更想用 pytest，说一声，AW-0 要重写。
 - **`requirements.txt` 要不要硬加 `pywin32`？** 它会让安装变重（带一堆 win32 扩展），
   而现有代码在缺失时是能降级工作的。也可以只在注释里标成可选依赖。
+- **AW-11 扩展名重叠：拦截保存 vs. 允许「明确覆盖」？** 我判定重叠非设计意图
+  （依据见 AW-11 条目），故选了**直接拦截保存**（弹窗提示后 return，与 AW-3 的 folder
+  校验一致）。AW-11 原文也允许另一种交互——「提示冲突但允许用户确认后覆盖」。
+  如果你希望保留「高级用户强行声明重叠、按分类顺序路由」的能力，说一声，改成
+  二次确认即可（纯函数无需改，只改 GUI 的拦截方式）。
 
 ## 收尾
 
