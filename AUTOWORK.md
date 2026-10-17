@@ -976,7 +976,7 @@
       未运行 `main.py` / `restore_files.py`，未在真实桌面验证，仓库根目录未生成 `config.json`
       （`ls config.json` 显式确认不存在；`git status` 仅 3 个预期改动文件）。
 
-- [ ] **AW-12 补 `requirements.txt` 与文档不一致（打磨）**
+- [x] **AW-12 补 `requirements.txt` 与文档不一致（打磨）**
       问题：`config.py:106-119` 用 `pythoncom` / `win32com.client` 创建开机自启快捷方式，
       但 `requirements.txt` 只有 `PyQt5` 和 `watchdog`，**没写 `pywin32`**；
       未安装时 `config.py:120-124` 会静默降级去写 `.bat`。另外 `README.md:45` 提到的
@@ -985,6 +985,54 @@
       README 把快捷方式那句改成与实际一致的说法。
       这条是文档/依赖声明，**验证方式**：`pip install -r requirements.txt` 的依赖能被解析
       （不要真的重装环境），并人工核对 README 描述与 `config.py` 实际行为一致。
+      ✅ 已完成（2026-10-17）：实际 **270** 个用例（265 → 270，净增 5 条，全在
+      `tests/test_config.py`：`TestAutoStartFallback` 4 条 + `TestAutoStartWithPywin32` 1 条），
+      `python -m unittest discover -s tests -v` 全绿。
+      **取舍：选「可选依赖 + 说明」，不硬加 `pywin32`。** 理由（先读代码确认了降级行为）：
+      `_create_startup_shortcut` 在 `import pythoncom` / `win32com.client` 失败时捕获
+      `ImportError`，改在启动文件夹写一个 `.bat`（`@echo off` + `python main.py`）；
+      且 `get_auto_start()` / `set_auto_start()` **两条路径都同时认 `.lnk` 和 `.bat`**——
+      也就是说降级是**一等公民、被完整支持的运行模式**，不是意外。硬加 `pywin32` 会让这条
+      受支持路径对任何 `pip install -r requirements.txt` 的用户**不可达**（等于从默认安装里
+      删掉一个功能分支），而 `pywin32` 会带进一批 win32 扩展、安装更重（用户已在「待确认」
+      区点名担心这点）。本项是**打磨/一致性**条目，最小且诚实的修法是「让声明与实际相符」，
+      而「标成可选」不改变任何运行时行为/默认值（符合规则 7 的保守取向）。
+      - `requirements.txt`：加注释块写明 pywin32 是**可选**依赖、用途（开机自启的 `.lnk`）、
+        降级行为（写 `.bat`、登录时闪现控制台窗口、核心功能不依赖它），并把 `# pywin32>=306`
+        注释掉，想要的人取消注释即可安装。依赖解析仍只装 `PyQt5` / `watchdog`。
+      - `README.md`：①「环境要求」的依赖行改为「`PyQt5`、`watchdog`（必需）；`pywin32`
+        （**可选**，见下）」+ 一条子项说明降级行为；②「打包与分发」那句 `桌面文件收纳.lnk`
+        原文说「本仓库同时提供」，但 `.gitignore` 忽略 `*.lnk`（还有 `dist/`、`build/`、`*.spec`），
+        **该快捷方式既不在仓库里、本机也不存在**——改成如实说法：构建产物与本机快捷方式
+        **不随仓库分发**、需自己生成；并点明仓库实际跟踪的是打包**脚本**
+        （`installer/DesktopFileOrganizer.iss` + `installer/使用说明.txt`）。
+      - **新增 5 条用例把 README 承诺的降级行为钉住**（否则文档与代码一旦漂移没人会发现，
+        正是 AW-12 要修的那类问题）：`TestAutoStartFallback` 用
+        `mock.patch.dict(sys.modules, {"pythoncom": None, ...})` 逼出 `ImportError` →
+        断言写出 `.bat`（含 `sys.executable` 与 `main.py`）且**不**写 `.lnk`；
+        只有 `.bat` 时 `get_auto_start()` 仍为真；两者都没有时为假；`set_auto_start(False)`
+        同时删掉 `.lnk` 和 `.bat`。`TestAutoStartWithPywin32` 注入**假 `pythoncom` /
+        `win32com.client` 模块**（不碰真实 COM / 注册表）→ 断言走 `.lnk` 分支、
+        `CreateShortCut` 目标正是 `STARTUP_LNK`、且不写 `.bat`。
+        ⚠️ 红线：`STARTUP_LNK` 指向**真实** `%APPDATA%\...\Startup`，故 `AutoStartTestBase.setUp`
+        把它 `mock.patch("config.STARTUP_LNK", <临时目录>)`，并加护栏
+        `assert_paths_inside_tmp()`（路径落到临时目录外立即炸）——**绝不真的创建开机自启快捷方式**。
+      反向验证（**两步定点破坏**，未用 `git checkout origin/master -- <文件>` 那种超集回退；
+      每步先 `git diff` 确认 `BREAK-AW12` 标记生效、`grep BREAK-AW12` 命中）：
+      (A) 把 `except ImportError` 的降级分支改成 `pass`（不再写 `.bat`）→ 重跑得 **1 failed**，
+          正是 `test_missing_pywin32_falls_back_to_bat`（断言输出「缺失 pywin32 时应写出 .bat」）；
+      (B) 把 `shell.CreateShortCut(STARTUP_LNK)` 改成 `CreateShortCut(STARTUP_LNK + ".wrong")`
+          → 重跑得 **1 failed**，正是 `test_uses_lnk_when_pywin32_available`，
+          断言输出显示 `CreateShortCut` 的实参是 `...lnk.wrong`。
+      装回后 `grep BREAK` 0 命中、恢复 270 全绿。
+      依赖解析验证（**只读、未真的重装环境**）：
+      `python -m pip install --dry-run -r requirements.txt` → exit 0，
+      「Requirement already satisfied: PyQt5 / watchdog …」，**未提及 pywin32**（注释行被正确忽略）；
+      另 `python -m pip download --no-deps -d <临时目录> -r requirements.txt` → exit 0，
+      「Successfully downloaded PyQt5 watchdog」（PyQt5 5.15.11 + watchdog 6.0.0 两个 wheel），
+      下载目录用完即删。
+      未运行 `main.py` / `restore_files.py`，未真的创建开机自启快捷方式，未在真实桌面验证，
+      仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在；`git status` 仅 3 个预期改动文件）。
 
 - [ ] **AW-13 给桌面图标自动重排加配置开关（打磨，注意不要改默认行为）**
       问题：`main.py:104` + `file_manager.py:188-235` 每次启动**无条件**
@@ -1052,8 +1100,11 @@
   如果你想默认关掉，说一声。
 - **要不要引入 pytest？** 我选了标准库 unittest（零新依赖，符合仓库风格）。
   如果你更想用 pytest，说一声，AW-0 要重写。
-- **`requirements.txt` 要不要硬加 `pywin32`？** 它会让安装变重（带一堆 win32 扩展），
-  而现有代码在缺失时是能降级工作的。也可以只在注释里标成可选依赖。
+- ~~**`requirements.txt` 要不要硬加 `pywin32`？**~~ **AW-12 已拍板：选「可选依赖 + 说明」**
+  （理由见 AW-12 条目：降级是 `get_auto_start` / `set_auto_start` 完整支持的一等模式，
+  硬加会让该分支对 pip 用户不可达，且用户已担心安装变重）。当前 `requirements.txt` 用注释
+  标注 `# pywin32>=306` 为可选依赖。**若你更想要硬依赖**：把该行取消注释即可（一行改动），
+  并把 README「环境要求」里的「可选」措辞同步改掉。
 - **AW-11 扩展名重叠：拦截保存 vs. 允许「明确覆盖」？** 我判定重叠非设计意图
   （依据见 AW-11 条目），故选了**直接拦截保存**（弹窗提示后 return，与 AW-3 的 folder
   校验一致）。AW-11 原文也允许另一种交互——「提示冲突但允许用户确认后覆盖」。
