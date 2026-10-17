@@ -271,6 +271,33 @@
       全程 `tempfile.TemporaryDirectory()` + `mock.patch("config.CONFIG_PATH", 临时路径)`，
       未在真实桌面验证，仓库根目录未生成 `config.json`。
 
+- [ ] **AW-17 给 `_cleanup_partial` 加所有权校验 + 让拖拽路径上报 residual（AW-16 复查实测，数据安全）**
+
+      AW-16 的对抗性复查确认「够格」（98 用例真绿、跨盘用例经**定点破坏**证明是判别性的、
+      平台前提三处注释经实测准确、现实路径上无误删，并修好了旧实现「非空半截占位漏网」的真实缺陷），
+      **但实测出一个窄而真实的误删洞**：
+      `_move_dir_no_clobber` 的 `except BaseException` 分支**无条件 `rmtree(dest)`，
+      不校验 dest 是不是自己创建的**。复合竞态下会删掉非自己创建的目录：
+      (1) `os.rename` 抛 EXDEV（Windows 语义下意味着当时 dest 不存在）；
+      (2) dest 在 rename 与 copytree 之间被并发创建；
+      (3) src 在该窗口被删——此时真实 copytree 会在 `os.makedirs(dst)` **之前**的
+      `os.scandir(src)` 就失败。
+      复查**用真实 copytree 复现了用户数据被删**：
+      `victim still a dir=False / USERDATA.txt content=DELETED`。
+      概率极低，但代码层**没有任何所有权校验**——**不是假警报**。
+      修法（复查建议，廉价）：把「dest 已存在」与「copytree 起步失败」两类失败**分开**，
+      **只对「我们确实执行过 `makedirs` 之后」的失败做清理**——例如捕获 makedirs 成功的信号，
+      或失败时先确认 dest 内是否含本轮临时标识。
+      **关键：不能在无所有权证据时删目录。**
+      新增用例：构造上述复合竞态（src 消失 + dest 预存用户目录）→
+      断言**用户目录一字节没少**、且失败被如实上报。
+      顺带修一条既有缺陷：`categorize_file`（`file_manager.py:114`）与
+      `move_into_category`（`:208`）只看 `result.ok`，失败时 `return None, None`，
+      于是 **`.residual` 在拖拽路径上被静默吞掉**（属既有调用方，非 AW-16 引入）。
+      改成把 error 一并上报（至少写进日志），别让「有个半成品要手工清」这件事消失。
+      另外 docstring 对 POSIX 的表述略宽（非空目录抛 ENOTEMPTY，只有文件和空目录才静默替换）
+      ——顺手改准确。
+
 - [ ] **AW-3 修分类 `folder` 字段的路径越界（数据安全）**
       问题：`file_manager.py:30-33` 直接 `os.path.join(storage_root, folder)`，
       `folder` 来自用户自由文本（`dashboard.py:1093-1095`/`1112`/`1125`），
