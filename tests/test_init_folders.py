@@ -171,6 +171,72 @@ class TestInitFoldersFirstRun(InitFoldersTestBase):
         self.assertIsInstance(result.errors[0], OSError)
 
 
+# ── AW-19：坏配置不得让启动崩掉（init_folders 跳过非法分类）──
+
+class TestUnsafeCategoryDoesNotCrashStartup(InitFoldersTestBase):
+    """
+    AW-3 引入的回归：非法 `folder` 会让 `init_folders` 原样抛 `UnsafeCategoryFolder`，
+    而它由 `main.py:101` 在 `MainApp.__init__` 里直接调用（未包 try）→ **启动即崩**。
+    修法：跳过该分类 + 记 ERROR 日志，其余分类照常初始化（可见的降级）。
+    """
+
+    def _bad_cat(self):
+        return {"name": "恶意分类", "extensions": ["evil"], "folder": "..\\..\\evil"}
+
+    def test_init_folders_skips_bad_category_and_keeps_others(self):
+        cats = [self._bad_cat()] + [dict(c) for c in CATEGORIES]
+        cfg = self.make_config(initialized=False, categories=cats)
+        good_src = self.write_file(os.path.join(self.desktop, "report.doc"), "hi")
+        bad_src = self.write_file(os.path.join(self.desktop, "x.evil"), "evil")
+
+        # 不抛异常 = 应用能启动
+        with self.assertLogs("file_manager", level="ERROR") as cm:
+            result = file_manager.init_folders(cfg)
+
+        # 坏分类被跳过：它的匹配文件留在桌面、没有被搬到任何地方
+        self.assertEqual(result.skipped, 1)
+        self.assertTrue(os.path.exists(bad_src), "坏分类匹配的文件不得被搬走")
+        # 其余分类照常工作：目录都建好了、正常文件也搬进去了
+        for c in CATEGORIES:
+            self.assertTrue(
+                os.path.isdir(os.path.join(self.storage, c["folder"])),
+                f"正常分类 {c['name']} 的目录应被创建",
+            )
+        moved = os.path.join(self.storage, "办公文件", "report.doc")
+        self.assertTrue(os.path.isfile(moved))
+        self.assertFalse(os.path.exists(good_src))
+        self.assertInsideTmp(moved)
+        # 可见的错误记录
+        joined = "\n".join(cm.output)
+        self.assertIn("已跳过", joined)
+        self.assertIn("恶意分类", joined)
+        # 首次搬移照常落盘（坏分类不影响 initialized 置位）
+        self.assertTrue(cfg["initialized"])
+        self.assertTrue(os.path.exists(self.config_path))
+
+    def test_init_folders_all_bad_categories_does_not_crash(self):
+        cfg = self.make_config(
+            initialized=False,
+            categories=[self._bad_cat(), {"name": "x", "extensions": [], "folder": ""}],
+        )
+        with self.assertLogs("file_manager", level="ERROR"):
+            result = file_manager.init_folders(cfg)  # 不抛异常
+        self.assertEqual(result.skipped, 2)
+        self.assertEqual(result.moved, 0)
+
+    def test_init_folders_skips_non_string_folder(self):
+        # "folder": 123 —— 以前 get_category_folder 会抛 TypeError（不是 UnsafeCategoryFolder）
+        cfg = self.make_config(
+            initialized=False,
+            categories=[{"name": "数字", "extensions": ["doc"], "folder": 123}],
+        )
+        src = self.write_file(os.path.join(self.desktop, "a.doc"), "data")
+        with self.assertLogs("file_manager", level="ERROR"):
+            result = file_manager.init_folders(cfg)  # 不抛 TypeError
+        self.assertEqual(result.skipped, 1)
+        self.assertTrue(os.path.exists(src), "非字符串 folder 的分类应被跳过，文件留下")
+
+
 # ── _move_matching_files ─────────────────────────────────
 
 class TestMoveMatchingFiles(InitFoldersTestBase):

@@ -14,7 +14,7 @@ if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
 from PyQt5.QtWidgets import (
-    QApplication, QSystemTrayIcon, QMenu,
+    QApplication, QSystemTrayIcon, QMenu, QMessageBox,
 )
 from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor, QPen
 from PyQt5.QtCore import Qt, QTimer
@@ -98,7 +98,15 @@ class MainApp:
         self.desktop_path = get_desktop_path(self.config)
 
         # 初始化分类文件夹（分类文件夹位于桌面外的存储目录，桌面保持整洁）
-        init_folders(self.config)
+        # AW-19：坏配置（非法 folder）只会让对应分类被跳过、记 ERROR 日志，
+        # 不再让 init_folders 抛出而崩掉整个启动流程；这里再给用户一个可见提示。
+        init_stats = init_folders(self.config)
+        if getattr(init_stats, "skipped", 0):
+            QMessageBox.warning(
+                None, "桌面文件收纳",
+                f"有 {init_stats.skipped} 个分类的目录名不安全，已跳过。\n"
+                "请在 config.json 里检查这些分类的 folder 字段后重启。",
+            )
 
         # 自动排列桌面图标
         arrange_desktop_icons()

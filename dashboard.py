@@ -1137,9 +1137,12 @@ class Dashboard(QMainWindow):
             self.config["categories"].append(new_cat)
             self._save_config()
 
-            # 创建文件夹
-            from file_manager import get_category_folder, _move_matching_files
-            folder_path = get_category_folder(self.config, new_cat)
+            # 创建文件夹（用 safe_* 变体：坏配置只跳过、不崩——AW-19）
+            from file_manager import safe_category_folder, _move_matching_files
+            folder_path = safe_category_folder(self.config, new_cat)
+            if folder_path is None:
+                QMessageBox.warning(self, "提示", "该分类的目录名不安全，已跳过。")
+                return
             os.makedirs(folder_path, exist_ok=True)
             _move_matching_files(self.desktop_path, folder_path, extensions)
 
@@ -1298,8 +1301,11 @@ class Dashboard(QMainWindow):
             return
         name = name.strip()
 
-        from file_manager import get_category_folder
-        folder = get_category_folder(self.config, self._current_category)
+        from file_manager import safe_category_folder
+        folder = safe_category_folder(self.config, self._current_category)
+        if folder is None:
+            QMessageBox.warning(self, "提示", "该分类的目录名不安全，已跳过。")
+            return
         path = os.path.join(folder, name)
         if os.path.exists(path):
             QMessageBox.warning(self, "提示", f"已存在同名文件夹「{name}」。")
@@ -1558,12 +1564,14 @@ class Dashboard(QMainWindow):
         save_config(self.config)
 
     def _update_status(self):
+        from file_manager import safe_category_folder
         total_cats = len(self.config["categories"])
-        # 统计所有分类文件夹中的文件总数
+        # 统计所有分类文件夹中的文件总数（非法分类跳过、不崩——AW-19）
         actual_total = 0
         for cat in self.config["categories"]:
-            from file_manager import get_category_folder
-            folder = get_category_folder(self.config, cat)
+            folder = safe_category_folder(self.config, cat)
+            if folder is None:
+                continue
             if os.path.isdir(folder):
                 actual_total += len([
                     f for f in os.listdir(folder)

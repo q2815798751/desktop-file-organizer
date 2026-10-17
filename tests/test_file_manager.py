@@ -9,6 +9,7 @@ GUI 模块（dashboard.py / desktop_panel.py）不导入。
 运行：python -m unittest discover -s tests -v
 """
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -266,6 +267,159 @@ class TestCategoryFolderSafety(TempDirsMixin, unittest.TestCase):
             err = file_manager.category_folder_error(self.storage, bad)
             self.assertIsNotNone(err, f"{bad!r} 应被判为不安全")
             self.assertTrue(err.strip())
+
+
+# ── AW-19：坏配置必须「可见地降级」，绝不崩 ──────────────
+
+class TestUnsafeCategoryDegradation(TempDirsMixin, unittest.TestCase):
+    """
+    AW-3 引入的回归：`UnsafeCategoryFolder` 全仓无人捕获，导致
+    init_folders / categorize_file / get_files_in_category / move_into_category
+    四条链遇到非法 `folder` 全部原样抛出（启动即崩 / abort 事件循环 / GUI 崩）。
+    现在各入口都改成「捕获 → 记 ERROR 日志 → 跳过该分类」。
+    """
+
+    def _bad_cat(self, folder="..\\..\\evil", name="恶意分类"):
+        return {"name": name, "extensions": ["evil"], "folder": folder}
+
+    def _cfg_with(self, *cats):
+        return self.make_config(categories=[dict(c) for c in cats])
+
+    # —— 3. 非字符串 folder 统一成 UnsafeCategoryFolder（不再是 TypeError）——
+
+    def test_non_string_folder_is_rejected_by_pure_validator(self):
+        err = file_manager.category_folder_error(self.storage, 123)
+        self.assertIsNotNone(err, "非字符串 folder 应被判为不安全")
+
+    def test_non_string_folder_raises_unsafe_not_typeerror(self):
+        cfg = self.make_config()
+        cat = {"name": "x", "extensions": [], "folder": 123}
+        with self.assertRaises(file_manager.UnsafeCategoryFolder):
+            file_manager.get_category_folder(cfg, cat)
+
+    # —— safe_category_folder：好分类照常解析 ——
+
+    def test_safe_folder_returns_path_for_good_category(self):
+        cfg = self.make_config()
+        cat = {"name": "图片", "extensions": [], "folder": "pics"}
+        self.assertEqual(
+            file_manager.safe_category_folder(cfg, cat),
+            os.path.join(self.storage, "pics"),
+        )
+
+    # —— safe_category_folder：坏分类 → None + 可见的 ERROR 记录 ——
+
+    def test_safe_folder_skips_bad_category_and_logs(self):
+        cfg = self.make_config()
+        with self.assertLogs("file_manager", level="ERROR") as cm:
+            got = file_manager.safe_category_folder(cfg, self._bad_cat())
+        self.assertIsNone(got)
+        joined = "\n".join(cm.output)
+        self.assertIn("已跳过", joined)
+        self.assertIn("恶意分类", joined)
+
+    def test_unsafe_category_message_is_pure_and_mentions_skip(self):
+        msg = file_manager.unsafe_category_message({"name": "办公文件"}, "越界")
+        self.assertIn("办公文件", msg)
+        self.assertIn("已跳过", msg)
+        self.assertIn("越界", msg)
+
+    # —— get_files_in_category 降级（GUI 刷新链）——
+
+    def test_get_files_in_category_skips_bad_category(self):
+        cfg = self.make_config()
+        with self.assertLogs("file_manager", level="ERROR") as cm:
+            got = file_manager.get_files_in_category(cfg, self._bad_cat())
+        self.assertEqual(got, [])
+        self.assertIn("已跳过", "\n".join(cm.output))
+
+    # —— categorize_file 降级（file_watcher 的 QTimer 槽）——
+
+    def test_categorize_file_does_not_raise_on_bad_category(self):
+        cfg = self._cfg_with(self._bad_cat())
+        src = self.write_file(os.path.join(self.desktop, "a.evil"), "data")
+        with self.assertLogs("file_manager", level="ERROR"):
+            name, dest = file_manager.categorize_file(src, cfg)  # 不抛异常
+        self.assertEqual((name, dest), (None, None))
+        self.assertTrue(os.path.exists(src), "源文件必须留在原处")
+
+    def test_categorize_file_skips_bad_and_uses_next_safe_category(self):
+        bad = self._bad_cat()
+        good = {"name": "好分类", "extensions": ["evil"], "folder": "good"}
+        cfg = self._cfg_with(bad, good)
+        src = self.write_file(os.path.join(self.desktop, "a.evil"), "data")
+        with self.assertLogs("file_manager", level="ERROR"):
+            name, dest = file_manager.categorize_file(src, cfg)
+        self.assertEqual(name, "好分类", "坏分类应被跳过、由下一个安全分类接管")
+        moved = os.path.join(self.storage, "good", "a.evil")
+        self.assertTrue(os.path.isfile(moved))
+        self.assertInsideTmp(moved)
+
+    # —— move_into_category 降级（拖拽链）——
+
+    def test_move_into_category_skips_bad_category(self):
+        cfg = self._cfg_with(self._bad_cat())
+        src = self.write_file(os.path.join(self.desktop, "a.txt"), "data")
+        with self.assertLogs("file_manager", level="ERROR"):
+            result = file_manager.move_into_category(cfg, self._bad_cat(), src)
+        self.assertEqual(result, (None, None))
+        self.assertTrue(os.path.exists(src), "拖拽到坏分类不得移动源文件")
+
+    # —— junction / 符号链接逃逸：realpath 复检 ——
+
+    def test_realpath_escape_detected_when_target_resolves_outside(self):
+        # 模拟「storage\\evil 已存在且是指向根外的 junction」：realpath 解析到根外
+        root = self.storage
+        outside = os.path.join(self.tmp, "outside")
+        target = os.path.join(root, "evil")
+        real = os.path.realpath
+
+        def fake_realpath(p):
+            if os.path.normcase(os.path.abspath(p)) == os.path.normcase(
+                os.path.abspath(target)
+            ):
+                return outside
+            return real(p)
+
+        with mock.patch("file_manager.os.path.realpath", side_effect=fake_realpath):
+            err = file_manager.realpath_escape_error(root, target)
+        self.assertIsNotNone(err, "realpath 落到根外必须被判越界")
+
+    def test_realpath_inside_is_allowed(self):
+        # 正常（含尚不存在）的目标解析仍在根内 → 放行，不误伤新分类
+        target = os.path.join(self.storage, "pics")
+        self.assertIsNone(
+            file_manager.realpath_escape_error(self.storage, target)
+        )
+
+    @unittest.skipUnless(os.name == "nt", "junction 只在 Windows 上可测")
+    def test_real_junction_escape_is_rejected(self):
+        """用真实 mklink /J 复现：词法校验放行，realpath 复检必须拒绝。"""
+        outside = os.path.join(self.tmp, "outside")
+        os.makedirs(outside)
+        link = os.path.join(self.storage, "evil")
+        try:
+            rc = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", link, outside],
+                capture_output=True,
+            ).returncode
+        except OSError:
+            self.skipTest("无法调用 cmd/mklink")
+        if rc != 0 or not os.path.isdir(link):
+            self.skipTest("本环境无法创建 junction（mklink 失败）")
+        # 清理：删 junction 链接本身（不动目标），先于 TemporaryDirectory 清理
+        self.addCleanup(lambda: os.rmdir(link) if os.path.isdir(link) else None)
+
+        # 词法校验会放行（这正是逃逸能发生的原因）
+        self.assertIsNone(file_manager.category_folder_error(self.storage, "evil"))
+
+        cfg = self.make_config()
+        cat = {"name": "evil", "extensions": [], "folder": "evil"}
+        with self.assertRaises(file_manager.UnsafeCategoryFolder):
+            file_manager.get_category_folder(cfg, cat)
+        with self.assertLogs("file_manager", level="ERROR") as cm:
+            self.assertIsNone(file_manager.safe_category_folder(cfg, cat))
+        self.assertIn("已跳过", "\n".join(cm.output))
 
 
 # ── _resolve_conflict ────────────────────────────────────

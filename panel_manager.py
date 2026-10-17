@@ -201,8 +201,11 @@ class PanelManager(QObject):
         save_config(self.config)
 
         # 创建文件夹并把桌面上已有的匹配文件移入
-        from file_manager import get_category_folder, _move_matching_files
-        folder_path = get_category_folder(self.config, new_cat)
+        # （用 safe_* 变体：坏配置只跳过、不崩——AW-19）
+        from file_manager import safe_category_folder, _move_matching_files
+        folder_path = safe_category_folder(self.config, new_cat)
+        if folder_path is None:
+            return None
         import os
         os.makedirs(folder_path, exist_ok=True)
         _move_matching_files(self.desktop_path, folder_path, extensions)

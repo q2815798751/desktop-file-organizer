@@ -26,8 +26,11 @@ DEFAULT_STORAGE_NAME = "桌面文件收纳"
 # 一次搬移的结果（结构化：成功/失败 + 原因），替代「失败时静默返回 None」。
 MoveResult = namedtuple("MoveResult", ["ok", "path", "error"])
 
-# 一批搬移的统计（成功数 / 失败数 / 失败原因列表），供 init_folders 汇总上报。
-MoveStats = namedtuple("MoveStats", ["moved", "failed", "errors"])
+# 一批搬移的统计（成功数 / 失败数 / 失败原因列表 / 因配置非法被跳过的分类数），
+# 供 init_folders 汇总上报。`skipped` 默认 0，旧的三元组构造调用无需改动。
+MoveStats = namedtuple(
+    "MoveStats", ["moved", "failed", "errors", "skipped"], defaults=(0,)
+)
 
 # 竞态下换名重试上限：_resolve_conflict 已保证正常情况不冲突，
 # 这里只兜底「解析出目标名之后、原子占用之前被别的进程抢占」的极窄窗口。
@@ -118,7 +121,12 @@ def category_folder_error(storage_root, folder_name):
     """
     if folder_name is None:
         return "子文件夹名不能为空。"
-    name = str(folder_name).strip()
+    if not isinstance(folder_name, str):
+        # 非字符串（如手工编辑 JSON 写成 "folder": 123）统一按不安全处理，
+        # 这样 category_folder_error 与 get_category_folder 的行为一致——
+        # 后者不会再去 os.path.join 一个非字符串而抛 TypeError（那是另一种错误类型）。
+        return "子文件夹名必须是文本。"
+    name = folder_name.strip()
     if not name:
         return "子文件夹名不能为空。"
 
@@ -146,12 +154,58 @@ def category_folder_error(storage_root, folder_name):
     return None
 
 
+def realpath_escape_error(storage_root, target):
+    """
+    只读文件系统的判定函数：复检 `os.path.realpath`，判断 `target` 是否因
+    **已存在的 junction / 符号链接**而解析到存储根之外。返回 None 或错误说明。
+
+    ⚠️ 为什么需要这一步（AW-19）：`category_folder_error` 是**纯词法**校验，
+    它只看字符串。若 `storage_root\\<folder>` 已经被替换成一个指向存储根之外的
+    junction（Windows 上 `mklink /J` 不需要管理员权限）或符号链接，
+    词法校验会**放行**，而文件实际会被写到存储根之外。复查已用 `mklink /J` 实测复现。
+
+    修法选择：**做 realpath 复检并拒绝落在根外的**（而不是把它记录成已知残留风险）。
+    理由：本程序的核心安全承诺是「用户的桌面文件只会在存储根内被搬动」；junction 会
+    悄悄打破这条承诺（同步软件或恶意程序都能植入），且本项已经让「拒绝」变成
+    **可见的降级**（应用照常启动、该分类被跳过并记日志），拒绝的代价很低。
+    真正需要把分类放到别的盘的用户应当改 `storage_path`，而不是链单个分类目录。
+
+    对**不存在**的路径，`realpath` 只解析已存在的前缀，因此新分类（目录尚未创建）
+    不会被误拒；只有「目标已存在且解析到根外」才会被判越界。
+    """
+    try:
+        real_root = os.path.realpath(storage_root)
+        real_target = os.path.realpath(target)
+        common = os.path.commonpath([real_root, real_target])
+    except ValueError:
+        # 不同盘符 / 无法比较 → 一定越界
+        return "目录解析到了存储目录之外。"
+    if common != real_root or real_target == real_root:
+        return "目录解析到了存储目录之外。"
+    return None
+
+
+def unsafe_category_message(category, error):
+    """
+    纯函数：为被跳过的非法分类生成一句**用户可见**的中文提示。
+
+    抽成纯函数是为了可单测（GUI 侧只负责把它展示出来，不重复拼接文案）。
+    """
+    name = category.get("name", "?") if isinstance(category, dict) else category
+    return f"分类「{name}」的目录名不安全，已跳过：{error}"
+
+
 def get_category_folder(config, category):
     """
     获取分类对应的子文件夹完整路径（位于存储根目录下，而非桌面）。
 
     ⚠️ 安全：`folder` 字段来自用户自由文本，可能越界（`..\\..\\evil`、绝对路径等），
     因此这里做越界校验：越界则抛 `UnsafeCategoryFolder`，**绝不静默兜底**到别处。
+    校验分两步：先做纯词法校验（`category_folder_error`），再对最终目标做
+    `realpath` 复检（`realpath_escape_error`），挡住 junction / 符号链接逃逸。
+
+    ⚠️ 本函数**会抛异常**。除本模块内部已改为「捕获并降级」的四个调用点外，
+    其它调用点（尤其是 GUI）应改用 `safe_category_folder`，不要让坏配置崩掉整个 App。
     """
     folder_name = category.get("folder", category["name"])
     root = get_storage_root(config)
@@ -161,7 +215,33 @@ def get_category_folder(config, category):
             f"分类「{category.get('name', folder_name)}」的子文件夹名不安全："
             f"{folder_name!r}（{error}）"
         )
-    return os.path.join(root, folder_name)
+    target = os.path.join(root, folder_name)
+    escape = realpath_escape_error(root, target)
+    if escape:
+        raise UnsafeCategoryFolder(
+            f"分类「{category.get('name', folder_name)}」的目录名不安全："
+            f"{target!r}（{escape}）"
+        )
+    return target
+
+
+def safe_category_folder(config, category):
+    """
+    同 `get_category_folder`，但**绝不抛 `UnsafeCategoryFolder`**。
+
+    坏配置（folder 越界，或 `storage_root\\<folder>` 是指向根外的 junction/符号链接）时，
+    记一条 ERROR 日志并返回 `None`，调用点据此**跳过该分类**。
+
+    这就是 AW-19 要的「可见的降级」：坏配置下应用照常启动、其余分类照常工作，
+    用户能在日志里看到「某个分类的目录名不安全，已跳过」，而不是整个 App 崩掉
+    （旧行为：`init_folders` 未捕获 → 启动即崩；`categorize_file` 在 QTimer 槽里
+    抛出 → abort 事件循环；`get_files_in_category` / `move_into_category` → GUI 崩）。
+    """
+    try:
+        return get_category_folder(config, category)
+    except UnsafeCategoryFolder as e:
+        logger.error("%s", unsafe_category_message(category, e))
+        return None
 
 
 def init_folders(config):
@@ -171,8 +251,12 @@ def init_folders(config):
     2. 仅首次运行时把桌面上已有的匹配文件移入对应文件夹
        （用 config 里的 initialized 标记，避免每次启动都静默移动文件）
 
-    返回 MoveStats(moved, failed, errors)：首次运行搬移的统计。
+    返回 MoveStats(moved, failed, errors, skipped)：首次运行搬移的统计。
     搬移失败不再被静默吞掉，调用方可以据此提示用户。
+
+    ⚠️ 坏配置（某分类的 folder 越界）不再让本函数抛异常：该分类被**跳过**
+    （计入 `skipped`）并记 ERROR 日志，其余分类照常初始化——
+    这样 `main.py:101` 的启动路径不会因为一个非法 `folder` 而整个崩掉。
     """
     desktop = get_desktop_path(config)
     first_run = not config.get("initialized", False)
@@ -180,9 +264,14 @@ def init_folders(config):
     moved = 0
     failed = 0
     errors = []
+    skipped = 0
 
     for cat in config["categories"]:
-        folder = get_category_folder(config, cat)
+        folder = safe_category_folder(config, cat)
+        if folder is None:
+            # 该分类配置非法 → 跳过它，其余分类照常工作（可见的降级）。
+            skipped += 1
+            continue
         os.makedirs(folder, exist_ok=True)
 
         if first_run:
@@ -197,7 +286,7 @@ def init_folders(config):
         from config import save_config
         save_config(config)
 
-    return MoveStats(moved, failed, errors)
+    return MoveStats(moved, failed, errors, skipped)
 
 
 def categorize_file(file_path, config):
@@ -219,7 +308,11 @@ def categorize_file(file_path, config):
     for cat in config["categories"]:
         extensions = [e.lower().lstrip(".") for e in cat.get("extensions", [])]
         if ext in extensions:
-            folder = get_category_folder(config, cat)
+            folder = safe_category_folder(config, cat)
+            if folder is None:
+                # 匹配到的分类配置非法 → 跳过它继续找别的安全分类，
+                # 绝不让 QTimer 槽（file_watcher.py:78）因坏配置抛出而 abort 事件循环。
+                continue
             os.makedirs(folder, exist_ok=True)
 
             result = _move_no_clobber(file_path, folder, os.path.basename(file_path))
@@ -237,8 +330,13 @@ def get_files_in_category(config, category):
     """
     列出分类文件夹中的顶层条目（文件 + 子文件夹），按修改时间降序排列。
     返回 [(full_path, name, mtime_datetime), ...]。子文件夹用 isdir 判断。
+
+    ⚠️ 坏配置（分类 folder 越界）不再抛异常：返回 `[]` 并记 ERROR 日志，
+    这样 GUI 刷新（dashboard/desktop_panel）不会因一个非法分类而整屏崩掉。
     """
-    folder = get_category_folder(config, category)
+    folder = safe_category_folder(config, category)
+    if folder is None:
+        return []
     if not os.path.isdir(folder):
         return []
 
@@ -295,11 +393,16 @@ def move_into_category(config, category, src_path):
     把外部文件/文件夹移入指定分类的存储文件夹（拖拽收纳用）。
     返回 (name, dest) 或 (None, None)。防护：拒绝移动分类文件夹本身 / 存储根，
     跳过已在目标分类内的条目。
+
+    ⚠️ 坏配置（分类 folder 越界）不再抛异常：返回 (None, None) 并记 ERROR 日志，
+    这样拖拽路径（dashboard/desktop_panel）不会因一个非法分类而崩。
     """
     if not os.path.exists(src_path):
         return None, None
 
-    folder = get_category_folder(config, category)
+    folder = safe_category_folder(config, category)
+    if folder is None:
+        return None, None
     src_abs = os.path.abspath(src_path)
     folder_abs = os.path.abspath(folder)
 
@@ -310,11 +413,12 @@ def move_into_category(config, category, src_path):
     except ValueError:
         pass  # 不同盘符，不在此判断
 
-    # 源是分类文件夹或存储根 → 拒绝
-    cat_folders = {
-        os.path.abspath(get_category_folder(config, c))
-        for c in config.get("categories", [])
-    }
+    # 源是分类文件夹或存储根 → 拒绝（非法分类直接跳过，不参与比较）
+    cat_folders = set()
+    for c in config.get("categories", []):
+        f = safe_category_folder(config, c)
+        if f is not None:
+            cat_folders.add(os.path.abspath(f))
     if src_abs in cat_folders or src_abs == os.path.abspath(get_storage_root(config)):
         return None, None
 
