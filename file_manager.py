@@ -466,6 +466,8 @@ def get_files_in_category(config, category):
 
     ⚠️ 坏配置（分类 folder 越界）不再抛异常：返回 `[]` 并记 ERROR 日志，
     这样 GUI 刷新（dashboard/desktop_panel）不会因一个非法分类而整屏崩掉。
+    ⚠️ 列目录失败（目录被删/权限不足/采样途中消失）同样返回 `[]`，但**记 WARNING 日志**
+    （AW-8）：返回值不变以免调用方崩，但「这个分类读不出来」这件事不能再无声无息。
     """
     folder = safe_category_folder(config, category)
     if folder is None:
@@ -480,7 +482,9 @@ def get_files_in_category(config, category):
             # 同时包含子文件夹（如「其他」里的项目文件夹）与普通文件
             mtime = os.path.getmtime(full)
             files.append((full, entry, datetime.fromtimestamp(mtime)))
-    except OSError:
+    except OSError as e:
+        # 返回 [] 保持公开契约（GUI 不能崩），但把失败原因记下来（AW-8）。
+        logger.warning("列出分类目录失败，返回空列表：%s（原因：%s）", folder, e)
         return []
 
     # 按修改时间降序（最新的在前）
@@ -492,8 +496,10 @@ def _move_matching_files(source_dir, target_dir, extensions):
     """
     将源目录中匹配扩展名的文件移动到目标目录。
 
-    返回 MoveStats(moved, failed, errors)：搬移失败不再被静默吞掉，
-    调用方（init_folders 等）据此统计失败数。
+    返回 MoveStats(moved, failed, errors)：搬移失败不再被静默吞掉——
+    既**返回**失败计数与原因（AW-2 的成果，保持不变），也**记录** WARNING 日志（AW-8），
+    这样无论调用方是否检查返回值，失败都不会无声无息（与归类/拖拽路径的
+    `_log_move_failure` 保持一致）。
     """
     moved = 0
     errors = []
@@ -501,7 +507,10 @@ def _move_matching_files(source_dir, target_dir, extensions):
     try:
         entries = os.listdir(source_dir)
     except OSError as e:
-        return MoveStats(0, 0, [e])
+        # 连源目录都列不出来 → 这是一次**失败**，不是「0 个文件」。
+        # 旧写法返回 failed=0 却带着非空 errors，只看失败计数的调用方会把它漏掉。
+        logger.warning("列出待整理目录失败：%s（原因：%s）", source_dir, e)
+        return MoveStats(0, 1, [e])
 
     os.makedirs(target_dir, exist_ok=True)
     wanted = [e.lower().lstrip(".") for e in extensions]
@@ -517,6 +526,8 @@ def _move_matching_files(source_dir, target_dir, extensions):
                 moved += 1
             else:
                 errors.append(result.error)
+                # 失败必须留下痕迹（含半成品残留路径），别让「首次整理」的失败消失。
+                _log_move_failure("首次整理", full, result.error)
 
     return MoveStats(moved, len(errors), errors)
 
@@ -780,51 +791,72 @@ def interpret_delete_result(result, aborted):
 
 # ── 桌面图标排列 ─────────────────────────────────────────
 
-def arrange_desktop_icons():
-    """自动排列桌面图标（对齐网格）。best-effort，失败静默返回 False。"""
-    try:
-        user32 = ctypes.windll.user32
-        user32.SendMessageW.argtypes = [
-            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
-        ]
-        user32.SendMessageW.restype = wintypes.LPARAM
-        WNDENUMPROC = ctypes.WINFUNCTYPE(
-            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
-        )
+def _arrange_desktop_icons_impl():
+    """
+    实际执行桌面图标排列（对齐网格）：找到桌面的 `SysListView32` 并发 `LVM_ARRANGE`。
 
-        LVM_ARRANGE = 0x1016
-        LVA_SNAPTOGRID = 0x5
+    返回 True 表示已发出排列消息；False 表示没找到目标窗口（如 Win+D / 幻灯片壁纸
+    等情况下连顶层枚举也没找到）。
 
-        def find_listview(hwnd):
-            """在 hwnd 下找 SHELLDLL_DefView → SysListView32。"""
-            defview = user32.FindWindowExW(hwnd, 0, "SHELLDLL_DefView", None)
-            if defview:
-                return user32.FindWindowExW(defview, 0, "SysListView32", None)
-            return 0
+    ⚠️ 本函数**不吞异常**——任何异常都向上抛，由 `arrange_desktop_icons` 统一记录。
+    把 ctypes 那一段抽成这个窄接口（可被 mock 注入），是为了让「排列失败」这条路径
+    **可单测**：旧实现把整段包在 `except Exception: pass` 里，测试根本够不到。
+    """
+    user32 = ctypes.windll.user32
+    user32.SendMessageW.argtypes = [
+        wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    ]
+    user32.SendMessageW.restype = wintypes.LPARAM
+    WNDENUMPROC = ctypes.WINFUNCTYPE(
+        wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+    )
 
-        found = []
+    LVM_ARRANGE = 0x1016
+    LVA_SNAPTOGRID = 0x5
 
-        def enum_cb(hwnd, _lparam):
-            lv = find_listview(hwnd)
-            if lv:
-                found.append(lv)
-                return False  # 停止枚举
-            return True
+    def find_listview(hwnd):
+        """在 hwnd 下找 SHELLDLL_DefView → SysListView32。"""
+        defview = user32.FindWindowExW(hwnd, 0, "SHELLDLL_DefView", None)
+        if defview:
+            return user32.FindWindowExW(defview, 0, "SysListView32", None)
+        return 0
 
-        # 主路径：Progman 下
-        progman = user32.FindWindowW("Progman", None)
-        if progman:
-            lv = find_listview(progman)
-            if lv:
-                found.append(lv)
+    found = []
 
-        # 兜底：Win+D / 幻灯片壁纸等情况下枚举顶层窗口
-        if not found:
-            user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
+    def enum_cb(hwnd, _lparam):
+        lv = find_listview(hwnd)
+        if lv:
+            found.append(lv)
+            return False  # 停止枚举
+        return True
 
-        if found:
-            user32.SendMessageW(found[0], LVM_ARRANGE, LVA_SNAPTOGRID, 0)
-            return True
-    except Exception:
-        pass
+    # 主路径：Progman 下
+    progman = user32.FindWindowW("Progman", None)
+    if progman:
+        lv = find_listview(progman)
+        if lv:
+            found.append(lv)
+
+    # 兜底：Win+D / 幻灯片壁纸等情况下枚举顶层窗口
+    if not found:
+        user32.EnumWindows(WNDENUMPROC(enum_cb), 0)
+
+    if found:
+        user32.SendMessageW(found[0], LVM_ARRANGE, LVA_SNAPTOGRID, 0)
+        return True
     return False
+
+
+def arrange_desktop_icons():
+    """
+    自动排列桌面图标（对齐网格）。best-effort，**失败返回 False**。
+
+    与旧实现的唯一区别（AW-8）：失败不再 `except Exception: pass` **静默**吞掉——
+    记一条 WARNING 日志（默认打到 stderr，用户/开发者看得见）后再返回 False。
+    返回值仍是布尔，调用方（`main.py`）的行为不变（排列只是锦上添花，失败不该拦启动）。
+    """
+    try:
+        return _arrange_desktop_icons_impl()
+    except Exception as e:
+        logger.warning("自动排列桌面图标失败（已忽略，不影响启动）：%s", e)
+        return False

@@ -1052,5 +1052,52 @@ class TestStabilityDecision(unittest.TestCase):
         )
 
 
+# ── 桌面图标排列：失败不再静默（AW-8） ───────────────────────
+#
+# 旧实现把整段 ctypes 逻辑包在 `except Exception: pass` 里：排列失败时
+# 用户和开发者都看不到（返回 False 也没人查）。现在把 ctypes 那段抽成
+# `_arrange_desktop_icons_impl`（可 mock 注入），失败记 WARNING 日志。
+# ⚠️ 用例**不调用**真实 `ctypes.windll`（那会真的重排真实桌面图标），
+# 只 mock 掉 `_arrange_desktop_icons_impl` 这个窄接口。
+
+class TestArrangeDesktopIcons(unittest.TestCase):
+
+    def test_failure_is_logged_and_returns_false(self):
+        with mock.patch(
+            "file_manager._arrange_desktop_icons_impl",
+            side_effect=RuntimeError("no desktop window"),
+        ):
+            with self.assertLogs("file_manager", level="WARNING") as cm:
+                ok = file_manager.arrange_desktop_icons()
+
+        self.assertFalse(ok, "排列失败应返回 False")
+        joined = "\n".join(cm.output)
+        self.assertIn("no desktop window", joined, "失败原因必须被记录，不能静默吞掉")
+
+    def test_success_returns_true(self):
+        with mock.patch(
+            "file_manager._arrange_desktop_icons_impl", return_value=True
+        ):
+            self.assertTrue(file_manager.arrange_desktop_icons())
+
+    def test_no_window_returns_false_without_error_log(self):
+        # 找不到目标窗口不是「失败」，只是没排（不应记 WARNING）
+        with mock.patch(
+            "file_manager._arrange_desktop_icons_impl", return_value=False
+        ):
+            self.assertFalse(file_manager.arrange_desktop_icons())
+
+    def test_exception_does_not_propagate(self):
+        # 关键回归点：旧实现 `except Exception: pass` 之外没有任何记录；
+        # 新实现必须「记录 + 返回 False」，绝不把异常抛给 main.py 拦掉启动。
+        with mock.patch(
+            "file_manager._arrange_desktop_icons_impl",
+            side_effect=OSError("ctypes blew up"),
+        ):
+            with self.assertLogs("file_manager", level="WARNING"):
+                ok = file_manager.arrange_desktop_icons()  # 不得抛出
+        self.assertFalse(ok)
+
+
 if __name__ == "__main__":
     unittest.main()

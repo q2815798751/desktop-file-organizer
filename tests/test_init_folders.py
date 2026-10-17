@@ -302,7 +302,8 @@ class TestMoveMatchingFiles(InitFoldersTestBase):
         src = self.write_file(os.path.join(self.source, "a.doc"), "keep")
 
         with mock.patch("file_manager.shutil.move", side_effect=OSError("boom")):
-            result = file_manager._move_matching_files(self.source, self.target, ["doc"])
+            with self.assertLogs("file_manager", level="WARNING") as cm:
+                result = file_manager._move_matching_files(self.source, self.target, ["doc"])
 
         self.assertTrue(os.path.exists(src), "移动失败时源文件必须保留")
         # 新行为：失败被统计并带上原因，而不是静默吞掉
@@ -310,6 +311,20 @@ class TestMoveMatchingFiles(InitFoldersTestBase):
         self.assertEqual(result.failed, 1)
         self.assertEqual(len(result.errors), 1)
         self.assertIsInstance(result.errors[0], OSError)
+        # AW-8：失败同时写进日志（不只靠调用方检查返回值）
+        self.assertIn("boom", "\n".join(cm.output), "失败原因必须被记录")
+
+    def test_listdir_failure_counted_as_failure_and_logged(self):
+        # AW-8：旧写法 `return MoveStats(0, 0, [e])` 把「列不出目录」算成 0 失败，
+        # 只看 failed 计数的调用方会漏掉。现在 failed=1，且记 WARNING。
+        with mock.patch("file_manager.os.listdir", side_effect=OSError("no access")):
+            with self.assertLogs("file_manager", level="WARNING") as cm:
+                result = file_manager._move_matching_files(self.source, self.target, ["doc"])
+
+        self.assertEqual(result.moved, 0)
+        self.assertEqual(result.failed, 1, "列目录失败必须计入失败数，而不是 0")
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("no access", "\n".join(cm.output), "失败原因必须被记录")
 
 
 # ── get_files_in_category ────────────────────────────────
@@ -364,6 +379,19 @@ class TestGetFilesInCategory(InitFoldersTestBase):
         with mock.patch("file_manager.os.listdir", side_effect=OSError("nope")):
             got = file_manager.get_files_in_category(self.cfg, self.cat)
         self.assertEqual(got, [])
+
+    def test_listdir_oserror_is_logged(self):
+        # AW-8：旧实现 `except OSError: return []` 静默吞掉——GUI 只看到「空分类」，
+        # 完全不知道目录读不出来。现在返回 [] 不变（契约），但必须记 WARNING。
+        os.makedirs(self.folder)
+        with mock.patch("file_manager.os.listdir", side_effect=OSError("no access")):
+            with self.assertLogs("file_manager", level="WARNING") as cm:
+                got = file_manager.get_files_in_category(self.cfg, self.cat)
+
+        self.assertEqual(got, [], "公开契约不变：仍返回 []，GUI 不崩")
+        joined = "\n".join(cm.output)
+        self.assertIn("no access", joined, "失败原因必须被记录")
+        self.assertIn(self.folder, joined, "必须指出是哪个分类目录读不出来")
 
 
 # ── _move_no_clobber（结构化结果 + 不覆盖）─────────────────

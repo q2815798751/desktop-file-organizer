@@ -20,6 +20,11 @@ AW-21 修复（数据安全）：
 - **分类目录名去重按 `os.path.abspath`**：旧实现按原始字符串去重，`shared` 与 `.\\shared`
   这类等价拼写不会去重，导致计划里同一文件出现两次。
 
+AW-8 修复（健壮性）：
+- **读配置失败不再静默用默认路径**：`restore()` 经 `_load_config_or_default()` 读配置，
+  失败时记一条 WARNING 再回退空配置（→ 默认路径 + 空分类清单 → 一个文件都不动）。
+  旧实现 `except Exception: pass` 让「配置没读到」这件事无人知晓。
+
 ⚠️ 本脚本会**真实移动文件**。测试必须全程在 `tempfile.TemporaryDirectory()` 里跑。
   ⚠️ `mock.patch("config.CONFIG_PATH", <临时路径>)` **只对当前写法有效**——因为本脚本
   通过 `config.load_config()` 在**调用时**读模块全局 `config.CONFIG_PATH`。若哪天把配置
@@ -38,6 +43,28 @@ logger = logging.getLogger(__name__)
 
 # 与 config / file_manager 保持一致的默认值
 _DEFAULT_STORAGE_NAME = "桌面文件收纳"
+
+
+def _load_config_or_default():
+    """
+    读取配置；**读失败时记录 WARNING 并回退空配置**（空配置 → 默认桌面 / 默认存储根）。
+
+    旧实现（AW-6 之前）在 `_storage_root()` 里 `except Exception: pass`，
+    配置读不出来就**静默**改用默认路径——用户和开发者都不知道配置没读到（AW-8）。
+    现在把这次失败记下来（WARNING 默认打到 stderr，跑脚本的人看得见）。
+
+    ⚠️ 行为说明：分类清单是**配置驱动**的，读失败 → `category_folders({})` 为空 →
+    恢复计划为空 → **一个文件都不会被移动**（fail-closed）。这比旧实现「读不到配置就
+    硬编码 5 个默认分类照搬」更安全：读不出配置时，我们无法确定用户的分类目录布局，
+    贸然搬文件的风险更大。抽成窄接口（依赖 `config.load_config`，可被 mock 注入）便于单测。
+    """
+    try:
+        return config.load_config()
+    except Exception as e:
+        logger.warning(
+            "读取配置失败（%s），改用默认路径；分类清单为空，不会移动任何文件", e
+        )
+        return {}
 
 
 def resolve_desktop(cfg):
@@ -178,7 +205,7 @@ def _resolve_dest(desktop, filename):
 
 def restore():
     """执行恢复：读配置 → 算计划 → 逐个搬回 `desktop_path` 指向的桌面。"""
-    cfg = config.load_config()
+    cfg = _load_config_or_default()
     root = resolve_storage_root(cfg)
     desktop, entries = build_restore_plan(cfg)
     print(f"从存储目录恢复: {root}")

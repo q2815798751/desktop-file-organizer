@@ -654,5 +654,51 @@ class TestSetupGuard(RestoreTestBase):
                 self._assert_fallback_desktop_inside_tmp()
 
 
+# ── 读配置失败：记录 + 回退默认（AW-8） ─────────────────────
+#
+# 旧实现（AW-6 之前）在 `_storage_root()` 里 `except Exception: pass`：配置读不出来
+# 就静默改用默认路径，用户和开发者都看不到。现在走 `_load_config_or_default()`：
+# 失败记 WARNING，回退空配置（→ 默认路径 + 空分类清单 → 一个文件都不动，fail-closed）。
+
+class TestUnreadableConfig(RestoreTestBase):
+
+    def test_read_failure_logs_and_returns_empty_config(self):
+        with mock.patch(
+            "restore_files.config.load_config", side_effect=OSError("disk on fire")
+        ):
+            with self.assertLogs("restore_files", level="WARNING") as cm:
+                cfg = restore_files._load_config_or_default()
+
+        self.assertEqual(cfg, {}, "读失败应回退空配置")
+        self.assertIn(
+            "disk on fire", "\n".join(cm.output), "读配置失败必须被记录，不能静默"
+        )
+
+    def test_success_returns_config_unchanged(self):
+        sentinel = {"categories": [{"name": "图片"}], "desktop_path": "D:/d"}
+        with mock.patch(
+            "restore_files.config.load_config", return_value=sentinel
+        ):
+            self.assertIs(restore_files._load_config_or_default(), sentinel)
+
+    def test_restore_with_unreadable_config_moves_nothing(self):
+        # 端到端：配置读不出来时，restore() 必须「记录 + 什么都不搬」（fail-closed）。
+        # spy 掉包 shutil.move：只记录调用，绝不真搬。
+        calls = []
+        with mock.patch(
+            "restore_files.config.load_config", side_effect=OSError("unreadable")
+        ), mock.patch(
+            "restore_files.shutil.move",
+            side_effect=lambda *a, **k: calls.append(a),
+        ):
+            with self.assertLogs("restore_files", level="WARNING") as cm:
+                with contextlib.redirect_stdout(io.StringIO()) as out:
+                    restore_files.restore()
+
+        self.assertEqual(calls, [], "读不到配置时不得搬动任何文件")
+        self.assertIn("unreadable", "\n".join(cm.output), "失败必须被记录")
+        self.assertIn("共恢复 0 个文件", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
