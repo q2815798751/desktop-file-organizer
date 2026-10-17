@@ -338,6 +338,25 @@
       全程 `tempfile.TemporaryDirectory()` + `mock.patch("config.CONFIG_PATH", 临时路径)`，
       未在真实桌面验证，仓库根目录未生成 `config.json`。
 
+- [ ] **AW-18 修 `(None,None)` 被当成功 + 清掉 AW-17 留下的过时 docstring（正确性 + 打磨）**
+
+      三件事，都来自 AW-17 的对抗性复查（该复查已确认 AW-17 够格、所有权声明真正闭合、
+      且「新窗口」之说是假警报——新旧窗口边界与宽度相同，只是把 makedirs 从 copytree
+      内部挪到了外面；真正被关掉的是那个更宽更易达的旧窗口）：
+      1. **既有正确性 bug**：`dashboard.py:1324` 与 `desktop_panel.py:400` 写成
+         `if p and move_into_category(...)`——而 `move_into_category` 失败时返回 `(None, None)`，
+         **非空元组恒为真**，所以**失败也被当成成功**（UI 会显示移动成功，实际没动）。
+         `categorize_file` 的调用方同理要查一遍。修法：判返回值而不是判元组本身
+         （例如判 `result[1]` 是否为 None）。**别改公开契约**（仍是 2 元组）。
+         新增用例：让移动失败 → 断言调用方**不**把这次操作算作成功。
+      2. **过时文档**：`_cleanup_partial` 的 docstring（`file_manager.py:281-291`）仍写
+         「`copytree` 的 `makedirs(exist_ok=False)` 抛 FileExistsError 时目标不是我们的，不清」——
+         **这句在 AW-17 之后已经不成立**（copytree 现在用 `dirs_exist_ok=True`，
+         所有权证据改由我们自己的 `os.makedirs(dest)` 提供）。既然 AW-17 主打「docstring 改准确」，
+         这处漏网的顺手补上。
+      3. 模块 docstring 里「POSIX 下空目录被替换会丢数据」措辞略强——空目录被替换**没有数据可丢**
+         （只是 no-clobber 被破坏）。改准确。
+
 - [ ] **AW-3 修分类 `folder` 字段的路径越界（数据安全）**
       问题：`file_manager.py:30-33` 直接 `os.path.join(storage_root, folder)`，
       `folder` 来自用户自由文本（`dashboard.py:1093-1095`/`1112`/`1125`），
