@@ -271,7 +271,7 @@
       全程 `tempfile.TemporaryDirectory()` + `mock.patch("config.CONFIG_PATH", 临时路径)`，
       未在真实桌面验证，仓库根目录未生成 `config.json`。
 
-- [ ] **AW-17 给 `_cleanup_partial` 加所有权校验 + 让拖拽路径上报 residual（AW-16 复查实测，数据安全）**
+- [x] **AW-17 给 `_cleanup_partial` 加所有权校验 + 让拖拽路径上报 residual（AW-16 复查实测，数据安全）**
 
       AW-16 的对抗性复查确认「够格」（98 用例真绿、跨盘用例经**定点破坏**证明是判别性的、
       平台前提三处注释经实测准确、现实路径上无误删，并修好了旧实现「非空半截占位漏网」的真实缺陷），
@@ -297,6 +297,46 @@
       改成把 error 一并上报（至少写进日志），别让「有个半成品要手工清」这件事消失。
       另外 docstring 对 POSIX 的表述略宽（非空目录抛 ENOTEMPTY，只有文件和空目录才静默替换）
       ——顺手改准确。
+      ✅ 已完成（2026-10-17）：实际 **102** 个用例（98 → 102，净增 4 条，全在
+      `tests/test_init_folders.py`：`TestCleanupOwnership` 2 条 +
+      `TestDragPathReportsFailure` 2 条），`python -m unittest discover -s tests -v` 全绿。
+      - **(1) 失败清理加所有权校验（核心）**：`_move_dir_no_clobber` 的跨盘分支改为
+        **先由自己 `os.makedirs(dest)`（`exist_ok=False`）原子占用目标名**，成功即拿到
+        「dest 是本轮创建的」这条所有权证据；随后 `copytree(src, dest, dirs_exist_ok=True)`
+        往里拷，**任何失败清理都只可能删到自己刚建的目录**。目标已存在 → `makedirs` 抛
+        `FileExistsError`（不是我们的）→ 原样上抛交给上层换名重试，**绝不清理**。
+        旧实现把「dest 已存在」与「copytree 起步失败」混为一谈、失败时无条件 `rmtree(dest)`：
+        copytree 第一步是 `os.scandir(src)`，src 在该窗口被并发删除时 copytree 会在
+        `makedirs` **之前**就失败，此时 dest 可能是别人/用户并发创建的目录 → 被误删。
+      - **(2) 拖拽路径上报失败原因**：`categorize_file` / `move_into_category` 失败时
+        不再只 `return None, None` 把 `result.error`（含 `PartialMoveError.residual`
+        半成品路径）静默吞掉，新增模块级 `logger` + `_log_move_failure(action, src, error)`
+        写进 WARNING 日志；公开 2 元组契约不变（`file_watcher` 的 `cat_name, new_path = ...`
+        解包不受影响）。
+      - **(3) docstring 改准确**：模块 docstring 与 `_move_dir_no_clobber` docstring 两处
+        的 POSIX 表述改为「`os.rename` 静默替换**文件**和**空目录**，非空目录抛 `ENOTEMPTY`」。
+      新增用例：
+      - `test_compound_race_does_not_delete_foreign_dest`：**用真实 `copytree`** 构造复合竞态
+        （mock `os.rename` 在抛 EXDEV 前并发创建 dest 用户目录 + 删除 src）→ 断言用户目录
+        仍在、`USERDATA.txt` 内容 == `PRECIOUS`（一字节没少）、且失败被如实上报（`result.ok` False）。
+      - `test_foreign_dest_not_deleted_when_copytree_fails_before_makedirs`：把解析逼到预存的
+        用户目录上、copytree 在 `os.scandir` 就失败 → 断言预存目录不被删（更直接的所有权对照）。
+      - `test_categorize_file_logs_move_failure` / `test_move_into_category_logs_residual`：
+        用 `assertLogs("file_manager", level="WARNING")` 断言失败原因与 `.residual` 残留路径
+        都出现在日志里，不再被吞掉。
+      另把既有 2 条 `copytree` 模拟桩（`test_cross_drive_copytree_failure_leaves_no_partial_dir`、
+      `test_leftover_is_reported_when_cleanup_fails`）里的 `os.makedirs(dst)` 改成
+      `exist_ok=True`——因为 dest 现在由本函数先建好，这样才是对「copytree 拷到一半失败」的
+      忠实模拟（语义未变，仍断言半拷贝残留被清干净）。
+      反向验证（**定点**，未用 `git checkout origin/master -- file_manager.py` 那种超集回退）：
+      只把 `_move_dir_no_clobber` 的跨盘分支改回旧的「无条件 `rmtree(dest)`」（去掉
+      `os.makedirs(dest)` 所有权步骤、`copytree` 去掉 `dirs_exist_ok=True` 并恢复
+      `except FileExistsError: raise`），`git diff` 确认 `BREAK` 标记已生效、`os.makedirs(dest)`
+      只剩既有位置 → 重跑得 **2 failed**，正是两条新增的所有权用例，断言输出是
+      `AssertionError: False is not true : 用户目录被误删了！`（即**用户目录真的被删掉了**，
+      在旧行为上实测复现，不是推断）。装回修复后恢复 102 全绿。
+      全程 `tempfile.TemporaryDirectory()` + `mock.patch("config.CONFIG_PATH", 临时路径)`，
+      未在真实桌面验证，仓库根目录未生成 `config.json`。
 
 - [ ] **AW-3 修分类 `folder` 字段的路径越界（数据安全）**
       问题：`file_manager.py:30-33` 直接 `os.path.join(storage_root, folder)`，
