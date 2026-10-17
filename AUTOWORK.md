@@ -491,12 +491,47 @@
       `mock.patch("config.CONFIG_PATH", 临时路径)`；未运行 `main.py` / `restore_files.py`，
       未在真实桌面验证，仓库根目录未生成 `config.json`（`git status` 仅 7 个预期改动文件）。
 
-- [ ] **AW-4 修 `move_into_category` 允许移入存储根祖先（数据安全）**
+- [x] **AW-4 修 `move_into_category` 允许移入存储根祖先（数据安全）**
       问题：`file_manager.py:153-159` 只拒绝「分类文件夹本身」和「存储根」，
       把 `Documents`（存储根的父目录）拖进面板，会把整个存储目录连分类一起搬进某个分类，
       导致存储根位移、配置全部失效。
       修法：拒绝**存储根及其所有祖先目录**（`os.path.commonpath` 或逐级 `dirname` 判断）。
       新增用例：把存储根、存储根父目录分别作为源 → 断言都被拒绝；正常桌面文件 → 仍可移入。
+      ✅ 已完成（2026-10-17）：实际 **153** 个用例（141 → 153，净增 12 条，全在
+      `tests/test_file_manager.py` 新增 `TestMoveIntoCategoryRejectsStorageAncestors`），
+      `python -m unittest discover -s tests -v` 全绿。
+      修法：新增模块级**纯函数** `storage_ancestor_error(storage_root, src_path)`
+      （返回 None 或一句中文错误说明），`move_into_category` 在原有「分类文件夹本身」
+      检查之后调它——是存储根本身或其祖先则 `return (None, None)`。
+      ⚠️ 本函数校验的是**源路径**，与 AW-3/AW-19 的 `category_folder_error` /
+      `realpath_escape_error`（**目标路径**校验）不是一回事，未复用/未混用。
+      判定规则：`os.path.abspath` 两边后取 `os.path.commonpath([src, root])`，
+      **`common == src` 即为祖先或本身**（`commonpath` 对不同盘符抛 `ValueError`
+      → 那不可能构成祖先 → 放行）。**刻意不用 `startswith`**：`...\sub\stor` 是
+      `...\sub\storage` 的字符串前缀，但它只是**兄弟目录**，`startswith` 会误判成祖先
+      而拒绝一次正常收纳（本机实测 commonpath 大小写不敏感、且返回与首参一致的写法）。
+      新增 12 条用例：存储根 / 立即父目录 / 祖父目录 / 顶层祖先分别被拒——
+      ⚠️ 这些用例**用 `mock.patch("file_manager._move_no_clobber")` 做 spy**，断言
+      「拒绝发生在搬移之前、根本没调用搬移」：祖先目录本身包含目标分类，就算真去搬
+      也会因「移进自己的子目录」失败，只看返回值 `(None, None)` 区分不出「被防护挡住」
+      与「搬移碰巧失败」，只有 spy 未调用才是判别性的；另含正常桌面文件/目录仍可移入、
+      前缀兄弟目录 `stor` 不被误拒、纯函数判别性（祖先→拒绝、非祖先/后代/前缀兄弟/
+      不同盘符→放行）。
+      反向验证（**两步定点破坏**，未用 `git checkout origin/master -- <文件>` 那种超集回退；
+      每步先 `git diff` 确认 `BREAK` 标记生效、`grep BREAK` 命中）：
+      (a) 把调用点的 `storage_ancestor_error(...)` 改回旧写法
+          `src_abs == os.path.abspath(get_storage_root(config))` → 重跑得 **4 failed**，
+          正是 `test_rejects_immediate_parent` / `test_rejects_grandparent` /
+          `test_rejects_top_ancestor` / `test_rejection_leaves_storage_and_categories_intact`；
+          断言输出显示无防护时 `_move_no_clobber` 确实被调用、`move_into_category`
+          返回了「成功」元组（在旧行为上实测复现，不是推断）。
+      (b) 把纯函数判据改成 `common == src and False`（永不拒绝）→ 重跑得 **6 failed**
+          （上述 4 条 + `test_rejects_storage_root` + `test_pure_function_rejects_ancestors`）。
+      装回后 `grep BREAK` 0 命中、恢复 153 全绿。
+      全程 `tempfile.TemporaryDirectory()` 造目录（存储根放深到 tmp/base/sub/storage
+      以便测多层祖先）、config 字典指向临时路径；未运行 `main.py` / `restore_files.py`，
+      未在真实桌面验证，仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在；
+      `git status` 仅 2 个预期改动文件）。
 
 - [ ] **AW-5 修回收站删除的标志位与结果判定（正确性）**
       问题：`dashboard.py:1611-1613` 把 `SHERB_NOCONFIRMATION/NOPROGRESSUI/NOSOUND`
