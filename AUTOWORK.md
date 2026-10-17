@@ -414,6 +414,45 @@
       全程 `tempfile.TemporaryDirectory()` 造目录、config 字典指向临时路径，
       未在真实桌面验证，仓库根目录未生成 `config.json`（`git status` 仅 3 个预期改动文件）。
 
+- [ ] **AW-19 处置 `UnsafeCategoryFolder`（AW-3 引入的回归）+ junction 逃逸（AW-3 复查实测）**
+
+      AW-3 的对抗性复查确认「核心路径越界都挡住了」（绝对路径、`..`、UNC、盘符、
+      空/`.`/纯分隔符，定点破坏 11 红），**但实测出两个必须处理的问题**：
+
+      **1. 🔴 AW-3 引入的回归：`UnsafeCategoryFolder` 全仓无人捕获。**
+      `grep -rn UnsafeCategoryFolder` 只有定义、raise 和测试——**没有任何 `except`**。
+      实测四条链都原样抛出：
+      - `init_folders`（`:185`，未包 try）← `main.py:101`（在 `MainApp.__init__` 里，未包 try）
+        → **启动即崩，App 根本起不来**；
+      - `categorize_file`（`:222`）← `file_watcher.py:78`（`_process_pending` 是 QTimer 槽，未包 try）
+        → PyQt5 槽内未捕获异常会 **abort 事件循环**；
+      - `get_files_in_category`（`:241`）← `dashboard.py:963/1241/1377`、`_update_status` 的 `:1566`、
+        `desktop_panel.py:326` → **GUI 刷新崩**；
+      - `move_into_category`（`:302/:315`）← `dashboard.py:1337`、`desktop_panel.py:402`（拖拽）→ 崩。
+      触发条件：`config.json` 里存在一个非法 `folder`（**手工编辑，或 AW-3 之前的旧配置**——
+      也就是**老用户升级后可能直接起不来**）。GUI 新建路径已被拦，正常点不出来。
+      修法：**在调用点捕获并降级**——跳过该分类 + 记日志/给用户可见提示，
+      **而不是让整个 App 崩**。至少保证：坏配置 → 应用仍能启动、其余分类照常工作、
+      且用户能看到「某个分类的目录名不安全，已跳过」。
+      ⚠️ AW-3 把「静默写到存储根外」换成了「静默崩溃」，两个都不能接受；
+      **正确目标是「可见的降级」**。改完请明确说明：坏配置下应用能否启动、用户会看到什么。
+      新增用例：配置里塞一个非法 `folder` → 断言 `init_folders` **不抛异常**、
+      该分类被跳过、其余分类正常；断言有可见的错误记录。
+
+      **2. junction / 符号链接逃逸（复查已用 `mklink /J` 实测复现）。**
+      若 `storage_root\<folder>` **已存在且是指向存储根之外的 junction/符号链接**，
+      路径级校验会放行，文件实际写到存储根之外：复查实测
+      `_move_no_clobber(victim.txt, storage\evil, ...) ok=True`，而 `victim.txt`
+      实际落在 `outside\` 里。触发前提是**预先存在该链接**（用户为省空间把分类目录
+      junction 到别的盘，或同步软件植入）。
+      修法（二选一，写清理由）：对最终目标做 `os.path.realpath` 复检并拒绝落在根外的；
+      或**明确记录为已知残留风险**（因为「用户故意把分类目录链到别的盘」可能是合法用法）。
+      选后者的话，必须在代码注释和 README 里写明这个前提，别让它悄悄存在。
+
+      **3. 次要**：非字符串 `folder`（如 `"folder": 123`）——`category_folder_error` 先 `str()` 判为安全，
+      但 `get_category_folder` 对原始值 `os.path.join(root, 123)` 抛 `TypeError`（不是 `UnsafeCategoryFolder`）。
+      仅手工改 JSON 可达，顺手统一成同一种错误类型。
+
 - [ ] **AW-4 修 `move_into_category` 允许移入存储根祖先（数据安全）**
       问题：`file_manager.py:153-159` 只拒绝「分类文件夹本身」和「存储根」，
       把 `Documents`（存储根的父目录）拖进面板，会把整个存储目录连分类一起搬进某个分类，
