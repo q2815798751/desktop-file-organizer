@@ -1034,7 +1034,7 @@
       未运行 `main.py` / `restore_files.py`，未真的创建开机自启快捷方式，未在真实桌面验证，
       仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在；`git status` 仅 3 个预期改动文件）。
 
-- [ ] **AW-13 给桌面图标自动重排加配置开关（打磨，注意不要改默认行为）**
+- [x] **AW-13 给桌面图标自动重排加配置开关（打磨，注意不要改默认行为）**
       问题：`main.py:104` + `file_manager.py:188-235` 每次启动**无条件**
       `LVM_ARRANGE/LVA_SNAPTOGRID` 重排用户桌面图标，用户无法关闭。
       修法：加一个配置项（如 `"arrange_icons": true`），**默认值保持 `true` 以不改变现有行为**，
@@ -1042,6 +1042,46 @@
       ⚠️ 默认值属于产品决策——**保持现状的默认值**是安全选择，不要改成 `false`。
       新增用例：`arrange_icons` 为 `false` → 断言不调用排列逻辑（打桩）；
       缺省（配置里没有这个键）→ 断言仍然排列（向后兼容）。
+      ✅ 已完成（2026-10-17）：实际 **280** 个用例（270 → 280，净增 10 条：
+      `tests/test_file_manager.py` 新增 `TestArrangeIconsConfigSwitch` 7 条 +
+      `tests/test_config.py` 新增 `TestArrangeIconsDefault` 3 条），
+      `python -m unittest discover -s tests -v` 全绿。
+      - **配置项与默认值**：`config.DEFAULT_CONFIG` 新增 `"arrange_icons": True`——
+        **默认 True，不改现有行为**（产品决策，保持现状；「待确认」区那条也据此）。
+      - **怎么让它可验证（GUI 入口不 import）**：新增**纯函数**
+        `file_manager.should_arrange_icons(config)`（`file_manager` 无 PyQt5 依赖、可直接
+        import）返回 `bool(config.get("arrange_icons", True))`——**只有显式 `false`
+        才关闭**，缺省 / `true` 都排列。`main.py` 的启动段改为
+        `if should_arrange_icons(self.config): arrange_desktop_icons()`
+        （`main.py` 仅 `py_compile`，未 import）。判定逻辑抽纯函数是沿用本仓库
+        AW-5/7/9/18 的既定套路。
+      - **向后兼容的两层保证**：(1) 纯函数层——`config` 里**没有这个键**时 `get` 的默认
+        参数 `True` 生效 → 仍排列；(2) 配置层——`load_config` 补全缺失默认字段时会把
+        老配置填成 `arrange_icons: True`。两层都断言到了。
+      - 新增用例：纯函数「缺省 → True（向后兼容）」「旧配置无键 → True」「显式 false →
+        False」「显式 true → True」；**复刻 main.py 门控 + 打桩窄接口
+        `_arrange_desktop_icons_impl`**：false → 断言排列逻辑**根本没被调用**
+        （`assert_not_called`）、缺省/true → 断言被调用一次（与 AW-18 的
+        `TestCallersCountMovesCorrectly` 同法）；配置层：`DEFAULT_CONFIG` 默认值为 True、
+        老配置缺键经 `load_config` 补成 True、显式 false 被保留。
+        ⚠️ 用例**不调用**真实 `ctypes.windll`（打桩 `_arrange_desktop_icons_impl`），
+        **绝不真的重排真实桌面图标**。
+      反向验证（**两步定点破坏**，未用 `git checkout origin/master -- <文件>` 那种超集回退；
+      每步先 `git diff` 确认 `BREAK-AW13` 标记生效、`grep BREAK-AW13` 命中）：
+      (A) 把 `should_arrange_icons` 改回无条件 `return True  # BREAK-AW13`
+          （即恢复旧的「永远排列」行为）→ 重跑得 **2 failed**，正是
+          `test_explicit_false_disables_arrange` / `test_disabled_does_not_call_arrange`
+          （证明「关掉」这条路径真被压到）；装回后恢复全绿。
+      (B) 把 `DEFAULT_CONFIG["arrange_icons"]` 改成 `False  # BREAK-AW13`
+          （模拟把默认值改成 false 的产品决策）→ 重跑得 **2 failed**，正是
+          `test_default_config_has_arrange_icons_true` /
+          `test_old_config_without_key_is_backfilled_true`（证明「默认 True」被钉住）。
+      装回后 `grep BREAK` 0 命中、恢复 280 全绿。
+      顺带把 README 的「桌面图标自动排列」条目与「配置」字段表补上 `arrange_icons`。
+      全程 `tempfile.TemporaryDirectory()` + `mock.patch("config.CONFIG_PATH", 临时路径)`；
+      未运行 `main.py` / `restore_files.py`，未在真实桌面验证、未真的重排真实图标，
+      仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在；
+      `git status` 仅 6 个预期改动文件）。
 
 - [ ] **AW-14 加 CI（打磨）**
       问题：仓库没有 `.github/workflows/`，改动没有任何自动把关。
