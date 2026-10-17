@@ -881,13 +881,47 @@
       未运行 `main.py` / `restore_files.py`，未在真实桌面验证，仓库根目录未生成 `config.json`
       （`ls config.json` 显式确认不存在；`git status` 仅 3 个预期改动文件）。
 
-- [ ] **AW-10 修 `config.py` 浅拷贝污染默认配置（正确性）**
+- [x] **AW-10 修 `config.py` 浅拷贝污染默认配置（正确性）**
       问题：`config.py:74-77` 用 `dict(DEFAULT_CONFIG)` 做浅拷贝，
       `categories` 内层（含 `subtypes`）与 `DEFAULT_CONFIG` **共享引用**，
       运行时原地修改会永久污染模块级默认值，导致「恢复默认」拿到的是被改过的配置。
       修法：改用 `copy.deepcopy`。
       新增用例：`load_config` 后原地改内层 `subtypes` → 断言 `DEFAULT_CONFIG` 未被污染；
       再次 `load_config` 拿到的是干净的默认值。
+      ✅ 已完成（2026-10-17）：实际 **246** 个用例（242 → 246，净增 4 条，全在
+      `tests/test_config.py` 新增 `TestDefaultConfigIsolation`），
+      `python -m unittest discover -s tests -v` 全绿。
+      - **先读代码再动手**：AW-1/AW-15 已把旧的 `config.py:74-77` 那段提取成
+        `_default_config()`（`config.py:61`），浅拷贝就藏在这里——`dict(DEFAULT_CONFIG)`
+        只浅拷贝顶层、`[dict(c) for c in ...]` 只浅拷贝每个分类字典的外层，于是
+        `categories[i]["subtypes"]` / `["extensions"]` 仍与模块级 `DEFAULT_CONFIG`
+        **共享引用**。实测复现：`load_config()` 后
+        `cfg["categories"][0]["subtypes"]["Word文档"].append("POLLUTED")` →
+        `DEFAULT_CONFIG` 里真的出现 `POLLUTED`，且反复污染累积成
+        `['doc','docx','POLLUTED','POLLUTED']`。
+      - **同一缺陷类的第二处**：`load_config` 的「补全缺失默认字段」`cfg[key] = val`
+        也会把 `DEFAULT_CONFIG` 的**共享引用**塞进 cfg（实测配置文件缺 `"categories"`
+        时 `cfg["categories"] is DEFAULT_CONFIG["categories"]` 为 True）——一并改为
+        `copy.deepcopy(val)`。
+      - 修法：`import copy`；`_default_config()` 改 `cfg = copy.deepcopy(DEFAULT_CONFIG)`；
+        缺失字段补默认值改 `cfg[key] = copy.deepcopy(val)`。
+      - 新增 4 条用例：返回配置的 `subtypes`/`extensions` 与 `DEFAULT_CONFIG`
+        **不是同一对象**（`assertIsNot`）；原地改内层（append 扩展名 + 往 subtypes
+        追加 + 新增子类型键）后 `DEFAULT_CONFIG` 仍等于「改动前的深拷贝快照」；
+        「恢复默认」——改完后删掉配置文件再 `load_config` → 拿到干净默认值（不含 POLLUTED）；
+        缺 `"categories"` 的配置文件补默认值后原地增删分类/子类型 → `DEFAULT_CONFIG`
+        仍等于快照、分类数仍为 5。
+      反向验证（**定点破坏**，未用 `git checkout origin/master -- <文件>` 那种超集回退）：
+      把 `_default_config` 改回 `dict(DEFAULT_CONFIG)` + `[dict(c) for c in ...]`、
+      把缺失字段补默认值改回 `cfg[key] = val`（均打 `# BREAK-AW10` 标记），
+      `git diff -- config.py` 确认 `copy.deepcopy` 已消失、`grep BREAK-AW10` 命中 3 处
+      （**回退已生效**）→ 重跑得 **4 failed**，正是 4 条新增用例，断言输出是
+      `AssertionError: 'POLLUTED' unexpectedly found in [...]` /
+      `unexpectedly identical: {...}`，即**污染真的发生了**（在旧行为上实测复现，非推断）；
+      装回修复、`grep BREAK` 0 命中后恢复 246 全绿。
+      全程 `tempfile.TemporaryDirectory()` + `mock.patch("config.CONFIG_PATH", 临时路径)`，
+      未运行 `main.py` / `restore_files.py`，未在真实桌面验证，仓库根目录未生成
+      `config.json`（`ls config.json` 显式确认不存在；`git status` 仅 2 个预期改动文件）。
 
 - [ ] **AW-11 新建/编辑分类时校验扩展名重叠（正确性）**
       问题：`dashboard.py:1108-1122` / `1171-1181` 不检查扩展名是否与其他分类重叠，
