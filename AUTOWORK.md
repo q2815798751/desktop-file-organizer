@@ -122,7 +122,7 @@
       装回修复后恢复 52 全绿。全程 `mock.patch("config.CONFIG_PATH", 临时路径)` +
       `tempfile.TemporaryDirectory()`，未在真实桌面验证，仓库根目录未生成 `config.json`。
 
-- [ ] **AW-2 修 `_resolve_conflict` 的 TOCTOU 与 `shutil.move` 静默失败（数据安全）**
+- [x] **AW-2 修 `_resolve_conflict` 的 TOCTOU 与 `shutil.move` 静默失败（数据安全）**
       ⚠️ **前置要求（AW-0/AW-1 两次复查都点名的覆盖缺口，必须先补）**：
       **`init_folders` 的 `first_run=True` 分支（真正执行搬移的那条）仍零覆盖**、
       `_move_matching_files` 零覆盖、`get_files_in_category` 零覆盖。
@@ -136,6 +136,32 @@
       调用方（`init_folders` / `_move_matching_files`）据此统计失败数。
       新增用例：目标已存在同名文件 → 断言重命名到 `name (1).ext` 且原文件保留；
       模拟 `shutil.move` 抛 `OSError` → 断言返回失败结果而不是静默吞掉。
+      ✅ 已完成（2026-10-17）：实际 **80** 个用例（52 → 80，新增 `tests/test_init_folders.py`
+      共 28 条；另顺手把 `test_name_conflict_renames_on_move` 补强为校验原文件内容保留，
+      不计数）。按要求**先补** `init_folders`(first_run) / `_move_matching_files` /
+      `get_files_in_category` 的旧行为用例（含「移动失败」路径），确认在旧代码上为绿
+      （52 → 72）再改代码；改完把其中 4 条旧行为断言改写为新行为。
+      修法：
+      - 新增 `_move_no_clobber(src, folder, filename)`：`_resolve_conflict` 降级为**只提议**
+        一个当前不冲突的名字（保持纯函数，原 6 条用例不变），真正落盘前用
+        `O_CREAT|O_EXCL`（文件）/ `os.rename`（目录，跨盘退回 `copytree`）**原子占用**目标名，
+        被抢占则换名重试——彻底关掉「先查存在再 move」之间那条竞态窗口（旧代码在 Windows 上
+        会经 shutil.move→copy2 静默覆盖被抢占的同名文件，造成数据丢失）。
+      - 移动失败不再 `except: pass`，改为返回 `MoveResult(ok, path, error)`；
+        `_move_matching_files` / `init_folders` 汇总为 `MoveStats(moved, failed, errors)`
+        （旧行为：`init_folders` 恒返回 0、`_move_matching_files` 无返回值、失败静默）。
+        公开 API `categorize_file` / `move_into_category` 的 `(name, dest)` / `(None, None)`
+        契约保持不变（`file_watcher.py` 要按 2 元组解包）。
+      反向验证（两步，回退前都先 `git diff` 确认生效）：
+      (1) `cp` 备份后 `git checkout -- file_manager.py` 撤掉**整个**修复，`git diff --stat`
+          确认 file_manager.py 已无改动、grep 不到 `_move_no_clobber` → 重跑得 **12 红**
+          （11 个 ERROR 因辅助函数不存在 + 1 个 FAIL：`test_categorize_file_race_does_not_clobber`
+          在**旧** `categorize_file` 上真的检出被覆盖）；
+      (2) 只把 `_move_file_no_clobber` 的原子占位退回旧的直接 `shutil.move`（保留其余 API），
+          `git diff` 确认后重跑 2 条竞态用例 → **2 failed**，断言输出正是 `'NEW' != 'RACER'`
+          （抢跑者写入的文件被覆盖）。装回修复后恢复 80 全绿。
+      全程 `tempfile.TemporaryDirectory()` + `mock.patch("config.CONFIG_PATH", 临时路径)`
+      （`init_folders` 会调 `save_config`），未在真实桌面验证，仓库根目录未生成 `config.json`。
 
 - [ ] **AW-15 加固「配置损坏」的回退方向（AW-1 复查实测出的隐患，数据安全）**
       > 编号是后补的，但**位置在此处表示它比 AW-3 及之后的所有条目优先**。
