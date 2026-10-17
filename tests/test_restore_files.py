@@ -35,16 +35,6 @@ import file_manager  # noqa: E402
 import restore_files  # noqa: E402
 
 
-# AW-14：`os.path.abspath("con")` 是否会把 Windows 保留设备名解析成设备路径 `\\.\con`。
-# 这是 **Windows 版本相关** 的行为：Windows 10 会（于是 commonpath 抛 ValueError），
-# 而 GitHub Actions 的 windows-latest（Windows Server 2025）不会——同样 Python 3.14，
-# 本机跑绿、CI 上 `_category_dir` 返回 `...\storage\con` 而不是 None。
-# 该行为只影响 `TestCategoryDir.test_reserved_device_name_hits_valueerror_branch`
-# （它专门覆盖 `_category_dir` 的 `except ValueError` 分支），故用这个探测与环境对齐：
-# 环境不提供该分支时**跳过**，而不是把用例改成对任何环境都恒真（那等于没测）。
-_ABSPATH_MAPS_DEVICE_NAMES = os.path.abspath("con").startswith("\\\\.\\")
-
-
 class RestoreTestBase(unittest.TestCase):
     """
     把 CONFIG_PATH 打桩到临时目录，绝不动仓库根目录的 config.json。
@@ -237,14 +227,25 @@ class TestCategoryDir(RestoreTestBase):
                 restore_files._category_dir(self.root, os.path.join("..", "evil"))
             )
 
-    @unittest.skipUnless(
-        _ABSPATH_MAPS_DEVICE_NAMES,
-        "本平台不把保留设备名解析成设备路径（Windows 10 会、Windows Server 2025 不会）："
-        "`_category_dir` 因此不会走 `except ValueError` 分支，本用例覆盖的分支在此环境不存在",
-    )
     def test_reserved_device_name_hits_valueerror_branch(self):
         # `con` 经 os.path.abspath 变成 `\\.\con`（设备路径）→ commonpath 抛 ValueError。
         # 这正是 _category_dir 里 `except ValueError` 分支的真实触发路径（旧测试零覆盖）。
+        #
+        # ⚠️ AW-14：这个「把保留设备名解析成设备路径」的行为**依赖 Windows 版本**，
+        # 而且只在「纯名字」形态下成立、在「绝对路径 + 该名字」形态下未必成立：
+        #   - 本机 Windows 10：`abspath("<root>\\con")` == `\\.\con` → 走 ValueError 分支；
+        #   - CI 的 windows-latest（Windows Server 2025，同样 Python 3.14）：
+        #     `abspath("con")` 仍是 `\\.\con`，但 `abspath("<root>\\con")` 是普通路径
+        #     → 不走 ValueError 分支，`_category_dir` 返回 `<root>\\con`（仍落在存储根内，
+        #     安全承诺未破，只是本用例覆盖的分支在该环境不存在）。
+        # 故用**与被测代码相同的构造**做环境探测：环境不提供该分支就 skip，
+        # 而不是把断言改成对任何环境恒真（那等于没测）。
+        probe = os.path.abspath(os.path.join(os.path.abspath(self.root), "con"))
+        if not probe.startswith("\\\\.\\"):
+            self.skipTest(
+                "本平台不把保留设备名解析成设备路径（Windows 10 会、Windows Server 2025 不会）："
+                "`_category_dir` 不走 `except ValueError` 分支，本用例覆盖的分支在此环境不存在"
+            )
         for folder in ("con", "aux", "nul"):
             with self.assertLogs("restore_files", level="WARNING"):
                 self.assertIsNone(
