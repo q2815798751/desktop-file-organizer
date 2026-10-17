@@ -6,7 +6,8 @@
 语义**——对已存在的文件或目录**一律**抛 `FileExistsError`，从不替换。
 而 POSIX 的 `os.rename` 语义不同：它会**静默替换**已存在的**文件**和**空目录**；
 只有目标是非空目录时才抛 `ENOTEMPTY`（此时不替换，与 Windows 一样安全）。
-也就是说 POSIX 下「文件和空目录」这两类目标会被静默覆盖/替换，会丢数据。
+也就是说 POSIX 下**文件**目标会被静默覆盖，**真的会丢数据**；而**空目录**被替换
+只是破坏了 no-clobber 保证（空目录里没有数据可丢，不会丢文件）。
 本项目是 Windows 专用（大量 `ctypes.windll` 调用），故当前是安全的；
 但**移植到 POSIX 之前必须先改**这里（见 `_move_dir_no_clobber`），否则会踩。
 """
@@ -53,6 +54,20 @@ def _log_move_failure(action, src, error):
         )
     else:
         logger.warning("%s失败，源保留原处：%s（原因：%s）", action, src, error)
+
+
+def did_move(result):
+    """
+    判断 `categorize_file` / `move_into_category` 的返回值是否代表**真的移动了**。
+
+    这两个函数的公开契约是 2 元组：成功返回 `(name, dest)`，失败返回 `(None, None)`。
+    ⚠️ 陷阱：`(None, None)` 是**非空元组，在布尔语境里恒为真**，所以绝不能写
+    `if move_into_category(...):`——那会把**失败也当成成功**（UI 显示已收纳、
+    实际文件没动）。本函数判的是返回值里的 dest 是否为 None，而不是判元组本身。
+
+    供调用方（含 GUI 拖拽路径）使用；本函数是纯函数，便于单测。
+    """
+    return result is not None and result[1] is not None
 
 
 def get_desktop_path(config):
@@ -286,8 +301,11 @@ def _cleanup_partial(dest, is_dir):
       所以无条件删除——哪怕跨盘 `copy2` 已经写进部分内容（非空），
       也不能留下半截垃圾（旧实现只在大小为 0 时才删，非空残留会漏网）。
     - 目录：跨盘 `copytree` 中途失败留下的半拷贝树（源目录完好无损），
-      整个删除。注意只在**确认是我们创建的**时候才调用本函数：`copytree`
-      的 `makedirs(exist_ok=False)` 抛 FileExistsError 时目标不是我们的，不清。
+      整个删除。⚠️ 只在**确认目标目录是我们自己创建的**时候才调用本函数：
+      所有权证据来自 `_move_dir_no_clobber` 里我们自己的 `os.makedirs(dest)`
+      （`exist_ok=False`）——它先原子占用目标名，成功即证明 dest 是本轮的；
+      随后 `copytree(..., dirs_exist_ok=True)` 才往里拷。目标已存在时
+      `makedirs` 抛 `FileExistsError`，那目录不是我们的，**绝不清**。
     """
     try:
         if is_dir:

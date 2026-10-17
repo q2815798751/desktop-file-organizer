@@ -1317,11 +1317,13 @@ class Dashboard(QMainWindow):
 
     def _absorb_drops(self, category, paths):
         """执行拖拽收纳：把 paths 移入 category 的存储文件夹。"""
-        from file_manager import move_into_category
+        from file_manager import did_move, move_into_category
 
         moved = 0
         for p in paths:
-            if p and move_into_category(self.config, category, p):
+            # ⚠️ 不能写 `if p and move_into_category(...)`：失败返回 (None, None)，
+            # 非空元组恒为真，会把失败也当成功。用 did_move 判返回值本身。
+            if p and did_move(move_into_category(self.config, category, p)):
                 moved += 1
         if moved:
             self.refresh_current()

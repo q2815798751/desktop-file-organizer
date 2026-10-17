@@ -359,5 +359,69 @@ class TestMoveIntoCategory(TempDirsMixin, unittest.TestCase):
         self.assertTrue(os.path.isdir(folder))
 
 
+# ── did_move：调用方判定（失败不能被当成功）──────────────
+#
+# AW-18：`move_into_category` / `categorize_file` 失败时返回 (None, None)，
+# 而**非空元组恒为真**——旧 GUI 代码写 `if move_into_category(...)` 会把失败
+# 当成功（UI 显示已收纳、实际没动）。判定逻辑抽成纯函数 did_move 以便单测。
+
+class TestDidMove(unittest.TestCase):
+    """did_move 的纯逻辑：判的是返回值里的 dest，不是元组本身。"""
+
+    def test_failure_tuple_is_not_a_move(self):
+        self.assertFalse(file_manager.did_move((None, None)))
+
+    def test_success_tuple_is_a_move(self):
+        self.assertTrue(
+            file_manager.did_move(("图片", os.path.join("x", "a.png")))
+        )
+
+    def test_judgement_only_depends_on_dest(self):
+        # 只看 dest 是否为 None，不依赖 name 的真假
+        self.assertTrue(file_manager.did_move((None, os.path.join("x", "a.png"))))
+
+    def test_none_result_is_not_a_move(self):
+        self.assertFalse(file_manager.did_move(None))
+
+    def test_nonempty_tuple_is_truthy_the_root_of_the_bug(self):
+        # 钉住陷阱本身：非空元组恒为真，正是旧写法必然误判的原因。
+        self.assertTrue(bool((None, None)))
+
+
+class TestCallersCountMovesCorrectly(TempDirsMixin, unittest.TestCase):
+    """端到端：让真实移动失败，断言调用方（用 did_move）不把它算作成功。"""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = self.make_config()
+        self.pics = CATEGORIES[2]  # 图片
+
+    def _count_moved(self, src, result):
+        """复刻 GUI 拖拽调用方的计数写法。"""
+        moved = 0
+        if src and file_manager.did_move(result):
+            moved += 1
+        return moved
+
+    def test_failed_move_into_category_not_counted(self):
+        src = self.write_file(os.path.join(self.desktop, "a.png"), "keep")
+        with mock.patch("file_manager.shutil.move", side_effect=OSError("boom")):
+            result = file_manager.move_into_category(self.cfg, self.pics, src)
+        self.assertEqual(self._count_moved(src, result), 0, "移动失败不能被算作成功")
+        self.assertTrue(os.path.exists(src), "失败时源文件必须保留")
+
+    def test_successful_move_into_category_counted(self):
+        src = self.write_file(os.path.join(self.desktop, "b.png"), "hi")
+        result = file_manager.move_into_category(self.cfg, self.pics, src)
+        self.assertEqual(self._count_moved(src, result), 1)
+
+    def test_failed_categorize_not_counted(self):
+        src = self.write_file(os.path.join(self.desktop, "c.png"), "keep")
+        with mock.patch("file_manager.shutil.move", side_effect=OSError("boom")):
+            result = file_manager.categorize_file(src, self.cfg)
+        self.assertEqual(self._count_moved(src, result), 0, "移动失败不能被算作成功")
+        self.assertTrue(os.path.exists(src), "失败时源文件必须保留")
+
+
 if __name__ == "__main__":
     unittest.main()

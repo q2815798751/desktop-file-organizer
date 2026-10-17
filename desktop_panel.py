@@ -392,12 +392,14 @@ class DesktopPanel(QWidget):
 
     def dropEvent(self, event):
         """把拖入的文件/文件夹移动进本面板的分类。"""
-        from file_manager import move_into_category
+        from file_manager import did_move, move_into_category
 
         moved = 0
         for url in event.mimeData().urls():
             p = url.toLocalFile()
-            if p and move_into_category(self.config, self.category, p):
+            # ⚠️ 不能写 `if p and move_into_category(...)`：失败返回 (None, None)，
+            # 非空元组恒为真，会把失败也当成功。用 did_move 判返回值本身。
+            if p and did_move(move_into_category(self.config, self.category, p)):
                 moved += 1
         if moved:
             self.refresh_file_list()
