@@ -10,7 +10,9 @@ init_folders（first_run 分支）/ _move_matching_files / get_files_in_category
 
 运行：python -m unittest discover -s tests -v
 """
+import errno
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -429,6 +431,176 @@ class TestResolveConflictRace(InitFoldersTestBase):
         self.assertEqual(self.read_file(os.path.join(folder, "a.doc")), "RACER")
         self.assertEqual(os.path.basename(dest), "a(1).doc")
         self.assertEqual(self.read_file(dest), "NEW")
+
+
+# ── 跨盘目录搬移（EXDEV → copytree 分支）──────────────────
+#
+# 所有目录用例默认都在同一个 tempdir（同盘），只走 os.rename 分支；
+# 跨盘正确性此前**完全靠 shutil.copytree 的实现细节兜底、零回归保护**。
+# 这里用 mock.patch 让 os.rename 抛 OSError(EXDEV) 强制走 copytree 分支。
+
+def _exdev(*_args, **_kwargs):
+    """模拟跨盘符：os.rename 抛 EXDEV。"""
+    raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+
+class TestCrossDriveDirectoryMove(InitFoldersTestBase):
+
+    def setUp(self):
+        super().setUp()
+        self.folder = os.path.join(self.tmp, "target")
+        os.makedirs(self.folder)
+
+    def test_same_drive_dir_move_uses_rename_not_copytree(self):
+        """同盘时走 os.rename，**不应**碰 copytree（对照组）。"""
+        src = os.path.join(self.tmp, "proj")
+        self.write_file(os.path.join(src, "in.txt"), "IN")
+
+        with mock.patch(
+            "file_manager.shutil.copytree", wraps=shutil.copytree
+        ) as cp:
+            result = file_manager._move_no_clobber(src, self.folder, "proj")
+
+        self.assertTrue(result.ok)
+        self.assertFalse(cp.called, "同盘搬移不该退回 copytree")
+
+    def test_cross_drive_dir_move_uses_copytree(self):
+        """EXDEV 时退回 copytree，且搬移结果正确、源目录被删除。"""
+        src = os.path.join(self.tmp, "proj")
+        self.write_file(os.path.join(src, "in.txt"), "IN")
+
+        with mock.patch("file_manager.os.rename", side_effect=_exdev), \
+             mock.patch(
+                 "file_manager.shutil.copytree", wraps=shutil.copytree
+             ) as cp:
+            result = file_manager._move_no_clobber(src, self.folder, "proj")
+
+        self.assertTrue(cp.called, "EXDEV 时必须走 copytree 分支")
+        self.assertTrue(result.ok)
+        self.assertEqual(os.path.basename(result.path), "proj")
+        self.assertTrue(os.path.isfile(os.path.join(result.path, "in.txt")))
+        self.assertEqual(self.read_file(os.path.join(result.path, "in.txt")), "IN")
+        self.assertFalse(os.path.exists(src), "跨盘搬移后源目录应被删除")
+
+    def test_cross_drive_dir_conflict_renames_and_preserves_existing(self):
+        """跨盘 + 目标已占：改名重试，绝不覆盖已存在的同名目录。"""
+        existing = os.path.join(self.folder, "proj")
+        self.write_file(os.path.join(existing, "old.txt"), "OLD")
+        src = os.path.join(self.tmp, "proj")
+        self.write_file(os.path.join(src, "new.txt"), "NEW")
+
+        with mock.patch("file_manager.os.rename", side_effect=_exdev):
+            result = file_manager._move_no_clobber(src, self.folder, "proj")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(os.path.basename(result.path), "proj(1)")
+        # 已存在的同名目录必须原地不动，新目录也不得嵌套进去
+        self.assertEqual(self.read_file(os.path.join(existing, "old.txt")), "OLD")
+        self.assertFalse(os.path.exists(os.path.join(existing, "new.txt")))
+        self.assertEqual(self.read_file(os.path.join(result.path, "new.txt")), "NEW")
+        self.assertFalse(os.path.exists(src))
+
+    def test_cross_drive_copytree_collision_retries_without_clobber(self):
+        """
+        逼 copytree 自己的 makedirs 撞上已被占用的目标名（FileExistsError）：
+        必须换名重试，绝不覆盖抢占者。
+        """
+        existing = os.path.join(self.folder, "proj")
+        self.write_file(os.path.join(existing, "old.txt"), "OLD")
+        src = os.path.join(self.tmp, "proj")
+        self.write_file(os.path.join(src, "new.txt"), "NEW")
+
+        real = file_manager._resolve_conflict
+        state = {"fired": False}
+
+        def racy(folder, filename):
+            dest = real(folder, filename)
+            if not state["fired"]:
+                state["fired"] = True
+                # 硬指向已占用的 proj，让 copytree 的 makedirs 抛 FileExistsError
+                return os.path.join(folder, filename)
+            return dest
+
+        with mock.patch("file_manager.os.rename", side_effect=_exdev), \
+             mock.patch("file_manager._resolve_conflict", side_effect=racy):
+            result = file_manager._move_no_clobber(src, self.folder, "proj")
+
+        self.assertTrue(result.ok, "撞上占用目标名后应换名重试而不是失败")
+        self.assertEqual(os.path.basename(result.path), "proj(1)")
+        self.assertEqual(self.read_file(os.path.join(existing, "old.txt")), "OLD")
+        self.assertFalse(os.path.exists(os.path.join(existing, "new.txt")))
+
+
+# ── 半拷贝残留清理（copytree / copy2 中途失败）────────────
+#
+# 旧实现：文件路径的 _release_placeholder 只在占位**大小为 0** 时才删，
+# 跨盘 copy2 已写入部分内容（非空）时会残留半截垃圾；目录路径**完全没有**
+# 清理机制，copytree 中途失败会在存储目录里留下一个半拷贝目录。
+
+class TestPartialMoveCleanup(InitFoldersTestBase):
+
+    def setUp(self):
+        super().setUp()
+        self.folder = os.path.join(self.tmp, "target")
+        os.makedirs(self.folder)
+
+    def test_cross_drive_copytree_failure_leaves_no_partial_dir(self):
+        """copytree 拷了一半失败 → 半拷贝目录必须被清掉，源目录完好。"""
+        src = os.path.join(self.tmp, "proj")
+        self.write_file(os.path.join(src, "in.txt"), "IN")
+
+        def boom(_src, dst, *_a, **_k):
+            os.makedirs(dst)  # 模拟 copytree 已原子占用目标名
+            self.write_file(os.path.join(dst, "half.txt"), "HALF")
+            raise OSError("disk full")
+
+        with mock.patch("file_manager.os.rename", side_effect=_exdev), \
+             mock.patch("file_manager.shutil.copytree", side_effect=boom):
+            result = file_manager._move_no_clobber(src, self.folder, "proj")
+
+        self.assertFalse(result.ok)
+        self.assertIsInstance(result.error, OSError)
+        self.assertEqual(os.listdir(self.folder), [], "半拷贝残留必须清理干净")
+        self.assertTrue(os.path.isfile(os.path.join(src, "in.txt")), "源目录必须完好")
+        self.assertEqual(self.read_file(os.path.join(src, "in.txt")), "IN")
+
+    def test_file_copy_failure_leaves_no_nonempty_placeholder(self):
+        """跨盘 copy2 已写入部分内容后失败 → 非空半截占位也必须清掉。"""
+        src = self.write_file(os.path.join(self.tmp, "a.doc"), "NEW")
+
+        def boom(_src, dst, *_a, **_k):
+            self.write_file(dst, "PARTIAL")  # 非空占位（旧实现会漏网）
+            raise OSError("disk full")
+
+        with mock.patch("file_manager.shutil.move", side_effect=boom):
+            result = file_manager._move_no_clobber(src, self.folder, "a.doc")
+
+        self.assertFalse(result.ok)
+        self.assertIsInstance(result.error, OSError)
+        self.assertEqual(os.listdir(self.folder), [], "非空半截占位必须清理干净")
+        self.assertTrue(os.path.exists(src))
+        self.assertEqual(self.read_file(src), "NEW")
+
+    def test_leftover_is_reported_when_cleanup_fails(self):
+        """清理本身失败时，残留路径必须上报到结果里，供调用方提示用户手工清。"""
+        src = os.path.join(self.tmp, "proj")
+        self.write_file(os.path.join(src, "in.txt"), "IN")
+
+        def boom(_src, dst, *_a, **_k):
+            os.makedirs(dst)
+            raise OSError("disk full")
+
+        with mock.patch("file_manager.os.rename", side_effect=_exdev), \
+             mock.patch("file_manager.shutil.copytree", side_effect=boom), \
+             mock.patch("file_manager.shutil.rmtree", lambda *_a, **_k: None):
+            result = file_manager._move_no_clobber(src, self.folder, "proj")
+
+        self.assertFalse(result.ok)
+        residual = getattr(result.error, "residual", None)
+        self.assertEqual(
+            residual, os.path.join(self.folder, "proj"),
+            "清理失败时必须把残留路径上报，而不是悄悄留下半成品",
+        )
 
 
 if __name__ == "__main__":

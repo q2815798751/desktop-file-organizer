@@ -1,5 +1,12 @@
 """
 文件管理模块 — 文件分类、移动、列出。
+
+⚠️ 平台前提（no-clobber 保证的基础）：
+本模块「绝不覆盖已存在的同名目标」这套保证，隐含依赖 **Windows 的 `os.rename`
+语义**——对已存在的文件或目录**一律**抛 `FileExistsError`，从不替换；
+而 POSIX 的 `os.rename` **会静默替换**已存在的目标。
+本项目是 Windows 专用（大量 `ctypes.windll` 调用），故当前是安全的；
+但**移植到 POSIX 之前必须先改**这里（见 `_move_dir_no_clobber`），否则会踩。
 """
 import errno
 import os
@@ -226,16 +233,40 @@ def _resolve_conflict(folder, filename):
         counter += 1
 
 
-def _release_placeholder(dest, is_dir):
-    """撤掉未被使用的占位（仅当它还是空的），避免留下垃圾文件。"""
+class PartialMoveError(OSError):
+    """
+    搬移失败，且失败时留下的半成品（空占位 / 半拷贝目录）**没能清干净**。
+
+    正常情况下失败会被清理掉、不留垃圾；只有当清理本身也失败时（例如文件
+    被别的进程锁住）才抛这个错误。残留路径见 `.residual`，调用方可据此提示
+    用户「有个半成品要手工清」，而不是让垃圾悄悄躺在存储目录里。
+    """
+
+    def __init__(self, cause, residual):
+        super().__init__(f"搬移失败且半成品未清干净：{residual}（原因：{cause}）")
+        self.cause = cause
+        self.residual = residual
+
+
+def _cleanup_partial(dest, is_dir):
+    """
+    清掉失败搬移留下的半成品。返回清理后**仍残留**的路径（清干净则返回 None）。
+
+    - 文件：占位是用 `O_CREAT|O_EXCL` 独占创建的，**一定是我们自己的**，
+      所以无条件删除——哪怕跨盘 `copy2` 已经写进部分内容（非空），
+      也不能留下半截垃圾（旧实现只在大小为 0 时才删，非空残留会漏网）。
+    - 目录：跨盘 `copytree` 中途失败留下的半拷贝树（源目录完好无损），
+      整个删除。注意只在**确认是我们创建的**时候才调用本函数：`copytree`
+      的 `makedirs(exist_ok=False)` 抛 FileExistsError 时目标不是我们的，不清。
+    """
     try:
         if is_dir:
-            if not os.listdir(dest):
-                os.rmdir(dest)
-        elif os.path.getsize(dest) == 0:
+            shutil.rmtree(dest, ignore_errors=True)
+        else:
             os.remove(dest)
     except OSError:
         pass
+    return dest if os.path.exists(dest) else None
 
 
 def _move_file_no_clobber(src, dest):
@@ -244,21 +275,33 @@ def _move_file_no_clobber(src, dest):
     目标已被别人占用时抛 FileExistsError（交由上层换名重试），
     因此绝不可能覆盖已存在的同名文件——这正是原来「先查存在再 move」
     之间那条竞态窗口会造成的数据丢失。
+
+    O_EXCL 保证了这个占位**一定是本进程创建的**，所以失败时可以直接清掉它
+    （跨盘 `copy2` 中途失败可能已写入部分内容，非空的半截同样要清）。
     """
     fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     os.close(fd)
     try:
         shutil.move(src, dest)
-    except BaseException:
-        _release_placeholder(dest, is_dir=False)
+    except BaseException as e:
+        leftover = _cleanup_partial(dest, is_dir=False)
+        if leftover is not None:
+            raise PartialMoveError(e, leftover) from e
         raise
 
 
 def _move_dir_no_clobber(src, dest):
     """
-    目录：os.rename 原子且不覆盖（目标已存在则 FileExistsError）。
-    跨盘符（EXDEV）时退回 copytree：它用 os.makedirs 原子占用目标名，
-    已存在同样抛 FileExistsError，因此不会覆盖或嵌套。
+    目录：`os.rename` 原子且不覆盖。
+
+    ⚠️ **平台前提**：`os.rename` 的「目标已存在则抛 FileExistsError、绝不替换」
+    是 **Windows 语义**；POSIX 的 `os.rename` 会**静默替换**已存在的目标目录，
+    那样就会丢数据——移植到 POSIX 前必须改用其它原子占位手段。
+
+    跨盘符（EXDEV）时退回 `copytree`：它内部第一步就是
+    `os.makedirs(dst, exist_ok=False)`，**原子占用**目标名，目标已存在同样抛
+    `FileExistsError`，因此不会覆盖或嵌套。
+    `copytree` 中途失败会留下半拷贝目录 → 清掉（源目录完好，只清我们建的那个）。
     """
     try:
         os.rename(src, dest)
@@ -268,8 +311,18 @@ def _move_dir_no_clobber(src, dest):
     except OSError as e:
         if getattr(e, "errno", None) != errno.EXDEV:
             raise
-    # 跨盘符
-    shutil.copytree(src, dest)
+    # 跨盘符：copytree 原子占用目标名（目标已存在 → FileExistsError → 上层换名重试）
+    try:
+        shutil.copytree(src, dest)
+    except FileExistsError:
+        # 目标被别的进程占用（copytree 的 makedirs 抛的）→ 不是我们的，交给上层换名重试
+        raise
+    except BaseException as e:
+        # 半拷贝残留：删掉这个不完整的 dest（src 完好无损）
+        leftover = _cleanup_partial(dest, is_dir=True)
+        if leftover is not None:
+            raise PartialMoveError(e, leftover) from e
+        raise
     shutil.rmtree(src)
 
 
@@ -280,6 +333,9 @@ def _move_no_clobber(src, folder, filename):
     与旧的「_resolve_conflict 之后直接 shutil.move」不同：
     - 名字是**原子占用**的，杜绝 TOCTOU 竞态覆盖；
     - 任何失败都以结构化结果返回（含原因），绝不静默吞掉。
+
+    ⚠️ 原子占用依赖平台语义：文件用 `O_CREAT|O_EXCL`（跨平台安全），
+    目录用 `os.rename`（**Windows 语义才不覆盖**，见 `_move_dir_no_clobber`）。
     """
     is_dir = os.path.isdir(src)
     last_error = None
