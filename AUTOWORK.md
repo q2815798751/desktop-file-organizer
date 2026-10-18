@@ -1310,6 +1310,11 @@
       `file_watcher.py` 仅 `py_compile`，均通过）；未运行 `main.py` / `restore_files.py`，
       未在真实桌面验证，仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在；
       `git status` 仅 4 个预期改动文件）。README 补了「重复文件检测」一节。
+      **CI 实跑确认**：push 后 GitHub Actions run `39105030191`（head `5654235`，
+      `autowork/2026-10-16`）→ **`conclusion=success`**，日志
+      `Ran 331 tests in 1.004s` / `OK (skipped=1)`（那 1 条 skip 是既有的设备名用例，
+      CI 的 Windows Server 不把带绝对路径前缀的保留设备名解析成设备路径——环境差异，
+      非本项引入；本机照常实跑）。
 
 - [ ] **AW-23 批量操作**（新功能）
       目标：仪表盘支持多选（Ctrl/Shift）后批量「移动到分类」/「删除」。
