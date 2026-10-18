@@ -1364,6 +1364,11 @@
       **没有创建符号链接的权限**（实测 WinError 1314，与 AW-9 的记录一致），故该用例
       `skipTest`；它覆盖的文件链接分支由上面那条**打桩 realpath** 的确定性用例兜住，
       junction 路径则由真实 `mklink /J` 用例实跑覆盖（**非 skip**）。
+      **CI 实跑确认（改动后）**：run `39108672906`（head `24fbf7e`）→ **`success`**，
+      日志 `Ran 341 tests in 1.244s` / `OK (skipped=1)`；那 1 条 skip 是**既有的**设备名用例
+      （`test_restore_files.TestCategoryDir.test_reserved_device_name_hits_valueerror_branch`，
+      环境差异），而本轮的**符号链接用例在 CI runner 上真的跑了**（runner 允许创建符号链接，
+      只有本机普通用户没权限，见上）。
 
 - [ ] **AW-23 批量操作**（新功能）
       目标：仪表盘支持多选（Ctrl/Shift）后批量「移动到分类」/「删除」。
