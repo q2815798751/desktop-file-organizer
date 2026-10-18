@@ -12,6 +12,7 @@
 但**移植到 POSIX 之前必须先改**这里（见 `_move_dir_no_clobber`），否则会踩。
 """
 import errno
+import hashlib
 import logging
 import os
 import shutil
@@ -906,6 +907,56 @@ def interpret_delete_result(result, aborted):
     return result == 0 and not aborted
 
 
+def send_to_recycle_bin(file_path):
+    """
+    把文件移入 Windows 回收站（**唯一的删除入口**）。返回 True 表示**确实移入成功**。
+
+    ⚠️ 为什么放在本模块（AW-22）：删除是危险操作，本仓库的约定是「删除一律走回收站、
+    绝不 `os.unlink`」。原先这段只存在于 `dashboard.py`（GUI 模块，测试不 import），
+    于是「重复文件」这类新功能要么复制一份实现（有分叉风险），要么没法被单测覆盖。
+    移到无 PyQt5 依赖的这里后，调用方可以**复用同一个入口**，测试也能打桩它、
+    并断言「没有走 `os.remove` / `os.unlink`」。
+
+    行为：用户点了「取消」时返回 False（此时 `SHFileOperationW` 仍返回 0，
+    必须靠 `fAnyOperationsAborted` 区分，否则会把「取消」当成删除成功、
+    界面显示删了实际没删）；真正的 API 错误仍抛 `OSError`。
+    标志位与结果判定用上面的两个纯函数（`build_delete_flags` /
+    `interpret_delete_result`），它们才是被单测覆盖的部分。
+
+    ⚠️ 本函数会真的调用 `SHFileOperationW`——**测试绝不能调用它**（会真删文件），
+    只能打桩。
+    """
+    # 需要双终止符
+    class SHFILEOPSTRUCTW(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("wFunc", wintypes.UINT),
+            ("pFrom", ctypes.c_wchar_p),
+            ("pTo", ctypes.c_wchar_p),
+            ("fFlags", wintypes.USHORT),
+            ("fAnyOperationsAborted", wintypes.BOOL),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", ctypes.c_wchar_p),
+        ]
+
+    FO_DELETE = 3
+
+    shfile = SHFILEOPSTRUCTW()
+    shfile.hwnd = None
+    shfile.wFunc = FO_DELETE
+    shfile.pFrom = file_path + "\0\0"
+    shfile.pTo = None
+    shfile.fFlags = build_delete_flags()
+
+    result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(shfile))
+    if not interpret_delete_result(result, shfile.fAnyOperationsAborted):
+        if shfile.fAnyOperationsAborted:
+            # 用户主动取消：不算错误，只是没删，别计入成功数。
+            return False
+        raise OSError(f"SHFileOperation failed with code {result}")
+    return True
+
+
 # ── 桌面图标排列 ─────────────────────────────────────────
 
 def should_arrange_icons(config):
@@ -996,3 +1047,196 @@ def arrange_desktop_icons():
     except Exception as e:
         logger.warning("自动排列桌面图标失败（已忽略，不影响启动）：%s", e)
         return False
+
+
+# ── 重复文件检测（AW-22） ─────────────────────────────────
+#
+# 目标：找出**内容相同**的文件，帮用户清理空间。
+#
+# ⚠️ 性能前提：**绝不整盘哈希**。先按 `st_size` 分组，只有「同尺寸且 ≥2 个」的
+# 候选才去读内容算 sha256（尺寸不同的文件内容一定不同，没必要读）。这样常见的
+# 「一堆各不相同的文件」场景只做 N 次 `getsize`，不读任何文件内容。
+#
+# ⚠️ 空文件（0 字节）**照常参与**：两个 0 字节文件内容确实相同，是合法的重复组
+# （sha256 是空串的固定值）。不因为「大小为 0 看着像异常」就把它们排除——
+# 那会让「清理空文件」这个常见诉求失效。
+#
+# ⚠️ 扫描范围：各分类目录下的**顶层普通文件**（不递归子文件夹）。原因：递归要处理
+# 子目录里的 junction / 符号链接逃逸（会读到存储根之外），代价与风险都更高；
+# 而重复文件的主要来源就是收纳进来的顶层文件。这条限制写在 `category_files` 里。
+DUPLICATE_CHUNK_SIZE = 1024 * 1024  # 算哈希时每次读取的字节数（1 MiB）
+
+# 重复组里的一个文件：路径 / 显示名 / 大小（字节）/ 所在分类名
+DuplicateEntry = namedtuple("DuplicateEntry", ["path", "name", "size", "category"])
+# 一组内容相同的文件：大小 / sha256 / 组内文件
+DuplicateGroup = namedtuple("DuplicateGroup", ["size", "digest", "entries"])
+# 一批删除的结果：真的删掉 / 用户取消 / 出错 / 出错明细 [(path, 原因)]
+DeleteStats = namedtuple("DeleteStats", ["deleted", "cancelled", "failed", "errors"])
+
+
+def file_sha256(path, chunk_size=DUPLICATE_CHUNK_SIZE, open_func=open):
+    """
+    只读 IO：算文件的 sha256 十六进制串；**读不到就返回 None**（不抛）。
+
+    分块读取（默认 1 MiB）而不是一次读进内存：重复文件检测可能碰上几百 MB 的文件，
+    一次性 `read()` 会把内存打爆。
+
+    读取失败（文件在扫描途中被删/被移走、权限不足、被独占锁住）返回 None，
+    由调用方跳过该文件——**一个读不了的文件不该让整次扫描崩掉**。
+    `open_func` 可注入，便于单测各种 `OSError`。
+    """
+    h = hashlib.sha256()
+    try:
+        with open_func(path, "rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                h.update(chunk)
+    except OSError:
+        return None
+    return h.hexdigest()
+
+
+def size_groups(paths, getsize=os.path.getsize):
+    """
+    纯逻辑 + 只读 IO：按文件大小分组，**只返回「同尺寸 ≥2 个」的候选组**。
+
+    返回 `[(size, [path, ...]), ...]`（按 size 升序、组内按路径排序，保证确定性）。
+
+    ⚠️ 这是「不整盘哈希」这条性能前提的落点：**大小唯一的文件直接出局**，
+    永远不会进入后续的哈希阶段（见 `find_duplicate_groups` 的用例）。
+    读不到大小的路径（已被删除 / 权限不足）直接跳过，不让它拖垮整次扫描。
+    """
+    buckets = {}
+    for p in paths:
+        try:
+            size = getsize(p)
+        except OSError:
+            continue
+        buckets.setdefault(size, []).append(p)
+    return [(s, sorted(buckets[s])) for s in sorted(buckets) if len(buckets[s]) > 1]
+
+
+def find_duplicate_groups(paths, getsize=os.path.getsize, hasher=file_sha256):
+    """
+    **纯逻辑 + 只读 IO**：找出内容相同的文件分组。
+
+    两阶段（AW-22 的要求）：
+    1. 按 `st_size` 分组 → 只有同尺寸 ≥2 个的候选才进入下一阶段；
+    2. 对候选逐个算 sha256 → 按哈希再分组 → **同哈希 ≥2 个**即为一组重复。
+
+    返回 `[(size, digest, [path, ...]), ...]`；组间按 **(大小降序, 哈希)** 排序
+    （最占空间的重复组排前面，先给用户看最值得清的），组内按路径排序。
+    算不出哈希（读取失败）的文件跳过，不会伪造出一组。
+
+    ⚠️ 「同大小不同内容」**不会**被误报：它们尺寸相同但哈希不同 → 分到不同组，
+    各自只有 1 个成员 → 不是重复组（用例 `test_same_size_different_content_is_not_a_group`）。
+    """
+    groups = []
+    for size, candidates in size_groups(paths, getsize=getsize):
+        by_digest = {}
+        for p in candidates:
+            digest = hasher(p)
+            if digest is None:
+                continue
+            by_digest.setdefault(digest, []).append(p)
+        for digest, members in by_digest.items():
+            if len(members) > 1:
+                groups.append((size, digest, sorted(members)))
+    groups.sort(key=lambda g: (-g[0], g[1]))
+    return groups
+
+
+def category_files(config):
+    """
+    只读：列出各分类目录下的**顶层普通文件** → `[(full_path, category_name), ...]`。
+
+    - 坏配置的分类（`folder` 越界 / junction 逃逸）由 `safe_category_folder` 跳过
+      （记 ERROR 日志，不抛异常，与 AW-19 的「可见降级」一致）；
+    - 目录不存在 → 跳过；列目录失败（权限/被删）→ 跳过并记 WARNING；
+    - **不递归子目录**：见本模块「重复文件检测」一节的说明。
+
+    本函数**绝不写文件系统**，只 `isdir` / `listdir` / `isfile`。
+    """
+    out = []
+    for cat in config.get("categories", []) or []:
+        folder = safe_category_folder(config, cat)
+        if folder is None:
+            continue
+        if not os.path.isdir(folder):
+            continue
+        try:
+            entries = os.listdir(folder)
+        except OSError as e:
+            logger.warning(
+                "扫描重复文件时列目录失败，已跳过：%s（原因：%s）", folder, e
+            )
+            continue
+        cat_name = cat.get("name", "?") if isinstance(cat, dict) else "?"
+        for entry in entries:
+            full = os.path.join(folder, entry)
+            if os.path.isfile(full):
+                out.append((full, cat_name))
+    return out
+
+
+def find_duplicates(config, getsize=os.path.getsize, hasher=file_sha256):
+    """
+    只读扫描所有分类目录，返回界面可直接渲染的重复组：
+    `[DuplicateGroup(size, digest, [DuplicateEntry(path, name, size, category), ...]), ...]`。
+
+    「跨分类重复」天然被覆盖：扫描是**跨分类统一分组**的，同一个文件出现在哪个分类
+    只影响 `DuplicateEntry.category` 这个展示字段，不影响它跟别的分类里的同内容文件
+    归到同一组。
+
+    ⚠️ 只读：不移动、不删除、不改配置。
+    """
+    files = category_files(config)
+    category_of = {path: cat for path, cat in files}
+    groups = find_duplicate_groups(
+        [path for path, _ in files], getsize=getsize, hasher=hasher
+    )
+    result = []
+    for size, digest, paths in groups:
+        entries = [
+            DuplicateEntry(p, os.path.basename(p), size, category_of.get(p, ""))
+            for p in paths
+        ]
+        result.append(DuplicateGroup(size, digest, entries))
+    return result
+
+
+def delete_duplicates(paths, delete_func=None):
+    """
+    把一批（重复）文件**移入回收站**，返回 `DeleteStats(deleted, cancelled, failed, errors)`。
+
+    ⚠️ 数据安全：**复用现有的「进回收站」接口**（`send_to_recycle_bin`），
+    **绝不 `os.unlink` / `os.remove`**——删除必须是可撤销的。用例
+    `TestDeleteDuplicates.test_uses_recycle_bin_and_never_unlinks` 把这条钉住。
+
+    - `delete_func` 可注入（默认 `send_to_recycle_bin`），便于单测：
+      测试打桩它、断言「每个文件都走了这个入口」，且**从不**调用 `os.remove`；
+    - 返回 True → 计入 `deleted`；返回 False（用户点「取消」）→ 计入 `cancelled`，
+      **不算删除成功**（与 `interpret_delete_result` 的语义一致）；
+    - 抛异常（文件被锁、路径消失）→ 计入 `failed` 并记 WARNING 日志，**继续处理剩下的**
+      （一个删不掉不该让整批停下），明细放在 `errors` 里，绝不静默吞掉（AW-8 的约定）。
+    """
+    if delete_func is None:
+        delete_func = send_to_recycle_bin
+
+    deleted = 0
+    cancelled = 0
+    errors = []
+    for p in paths:
+        try:
+            ok = delete_func(p)
+        except Exception as e:
+            errors.append((p, str(e)))
+            logger.warning("删除重复文件失败，已跳过：%s（原因：%s）", p, e)
+            continue
+        if ok:
+            deleted += 1
+        else:
+            cancelled += 1
+    return DeleteStats(deleted, cancelled, len(errors), errors)

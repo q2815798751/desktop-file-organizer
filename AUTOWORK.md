@@ -1243,7 +1243,7 @@
 > **数据安全红线照旧**：所有涉及移动/删除的用例只能在 `tempfile.TemporaryDirectory()` 里跑，
 > 绝不碰真实桌面与真实存储目录。
 
-- [ ] **AW-22 重复文件检测**（新功能）
+- [x] **AW-22 重复文件检测**（新功能）
       目标：仪表盘能找出内容相同的文件，给用户清理空间。
       做法：先按 `st_size` 分组，**只对同尺寸的算 sha256**（避免全盘哈希），再按哈希分组；
       同组 >1 个文件即为一组重复。界面上列出「组 → 文件列表（名称/大小/所在分类）」，
@@ -1251,6 +1251,65 @@
       边界：空文件、同大小不同内容、同内容不同文件名、跨分类重复都要覆盖。
       验证：单测覆盖分组纯函数 + 删除走回收站的分支（打桩）；`python -m unittest discover -s tests -v` 全绿；
       GUI 至少 `py_compile`，并说明哪些部分没有行为测试（别假装测过）。
+      ✅ 已完成（2026-10-18）：实际 **331** 个用例（284 → 331，新增 `tests/test_duplicates.py`
+      共 47 条），`python -m unittest discover -s tests -v` 全绿（**无 skip**）。
+      - **分组逻辑放 `file_manager.py`（无 PyQt5 依赖、可单测）**，三层：
+        `file_sha256(path, chunk_size=1MiB, open_func=open)`（分块读，读不到返回 `None`，
+        绝不抛）→ `size_groups(paths, getsize)`（**只返回同尺寸 ≥2 个的候选组**，
+        这是「不整盘哈希」这条性能前提的落点）→ `find_duplicate_groups(paths, getsize, hasher)`
+        （对候选算哈希、按哈希分组、同哈希 ≥2 个成组；组间按「大小降序、哈希」排序）。
+        `find_duplicates(config)` 只读扫描各分类目录的**顶层文件**，产出
+        `DuplicateGroup(size, digest, [DuplicateEntry(path, name, size, category)])`——
+        即界面要的「组 → 名称/大小/所在分类」。跨分类重复天然覆盖（扫描是跨分类统一分组的）。
+      - **删除复用同一个「进回收站」入口**：把原 `dashboard._send_to_recycle_bin` 的实现
+        **移到 `file_manager.send_to_recycle_bin`**（纯 ctypes，无 PyQt5 依赖），
+        `dashboard._send_to_recycle_bin` 改为薄封装委托——**全仓只剩一个删除实现**，
+        新功能不可能悄悄分叉出第二个。批量删除 `delete_duplicates(paths, delete_func=None)`
+        默认就用它，返回 `DeleteStats(deleted, cancelled, failed, errors)`；
+        取消（返回 False）**不计入成功数**（与 AW-5 的 `interpret_delete_result` 语义一致），
+        单个失败记 WARNING 且**不中断整批**（AW-8 的可观测约定）。
+      - **GUI（`dashboard.py`，未 import、仅 `py_compile`）**：搜索栏新增「重复文件」按钮
+        → `_on_find_duplicates`（WaitCursor + 扫描 + 无结果提示 + 弹窗 + 刷新）；
+        新增 `_DuplicateDialog`：两棵树（组标题不可选、文件行可选），列出名称/大小/所在分类，
+        确认后调 `delete_duplicates`，删完把条目从树上摘掉（组内剩 <2 个即移除整组）。
+      - 新增 47 条用例（`tests/test_duplicates.py`）：`file_sha256` 7 条（分块读一致性、
+        块大小被遵守、空文件 = `sha256("")`、缺失/权限错误返回 None、open 收到 path+`rb`）；
+        `size_groups` 8 条（只留 ≥2、尺寸唯一出局、空文件成候选、getsize 失败跳过、确定性排序）；
+        `find_duplicate_groups` 12 条（**同内容不同文件名成组**、**同大小不同内容不成组**、
+        **空文件成组**、**尺寸唯一的文件一次都没被哈希**（hasher spy）、
+        只对候选哈希、三副本一组、读不出的成员不凑组、组间大小降序、全不同返回空）；
+        `category_files` 6 条（顶层不递归、坏分类跳过并记 ERROR、列目录失败记 WARNING、只读）；
+        `find_duplicates` 7 条（**跨分类重复归一组**、entry 字段正确、空文件跨分类、
+        坏配置不拖垮扫描、扫描不改动任何文件）；`delete_duplicates` 7 条
+        （**走回收站且从不 `os.remove`/`os.unlink`**（把两者 patch 成「一调用就失败」）、
+        默认入口就是 `send_to_recycle_bin`、取消不计成功、失败继续处理并记日志）；
+        另有 2 条**源码级静态检查**（`dashboard.py` 里存在 `_on_find_duplicates` /
+        `delete_duplicates(` / `_send_to_recycle_bin`，且**不含** `os.remove` / `os.unlink`）
+        ——这是静态检查**不是**行为测试，已在用例 docstring 里写明。
+      反向验证（**三组定点破坏**，未用 `git checkout origin/master -- <文件>` 那种超集回退；
+      每组先 `git diff | grep BREAK` 确认破坏真的生效）：
+      (A) 把 `size_groups` 的过滤条件从 `> 1` 改成 `>= 1`（模拟「不分大小、全都去哈希」）
+          → 重跑得 **5 failed**，含 `test_unique_size_files_are_never_hashed` /
+          `test_hasher_called_only_for_same_size_candidates`（证明「不整盘哈希」被用例锁定）；
+      (B) 把 `delete_duplicates` 的 `delete_func(p)` 换成 `os.remove(p)`（模拟「直接永久删除」）
+          → 重跑得 **6 failed**，含 `test_uses_recycle_bin_and_never_unlinks` /
+          `test_default_delete_func_is_the_shared_recycle_bin_entry`；
+      (C) 把 `find_duplicate_groups` 的哈希分组改成常量 `"SAME"`（模拟「只按大小分组、
+          丢掉内容比较」）→ 重跑得 **7 failed**，含 `test_same_size_different_content_is_not_a_group`
+          （即「同大小不同内容被误报成重复」在旧行为上实测复现）。
+      装回后 `grep BREAK` 0 命中、恢复 331 全绿。
+      **GUI 的覆盖边界（如实说明，别当成测过）**：`_DuplicateDialog` 与
+      `_on_find_duplicates` 的**行为没有进测试套件**（规则 9：测试不 import GUI），
+      只做了 `py_compile` + 2 条源码级静态检查。另**在测试套件外**用一次性脚本做过
+      offscreen 冒烟（`QT_QPA_PLATFORM=offscreen`，只用临时目录里的假路径、
+      `delete_func=lambda p: True` 打桩、**不触发任何真实删除**）：组标题/子行
+      （名称·大小·分类）/选中取路径/删完摘条目均正常，`SMOKE_OK`；该脚本已删除、未入库。
+      全程 `tempfile.TemporaryDirectory()` 造目录、config 字典指向临时路径；
+      **从不调用真实 `SHFileOperationW`**（会真删文件），删除入口一律打桩；
+      未 import GUI 模块（`dashboard.py`/`desktop_panel.py`/`panel_manager.py`/`main.py`/
+      `file_watcher.py` 仅 `py_compile`，均通过）；未运行 `main.py` / `restore_files.py`，
+      未在真实桌面验证，仓库根目录未生成 `config.json`（`ls config.json` 显式确认不存在；
+      `git status` 仅 4 个预期改动文件）。README 补了「重复文件检测」一节。
 
 - [ ] **AW-23 批量操作**（新功能）
       目标：仪表盘支持多选（Ctrl/Shift）后批量「移动到分类」/「删除」。

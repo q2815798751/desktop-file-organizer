@@ -557,6 +557,13 @@ class Dashboard(QMainWindow):
         self._settings_btn.clicked.connect(self._open_settings)
         sl.addWidget(self._settings_btn)
 
+        # 重复文件检测（AW-22）：只读扫描所有分类目录，结果在弹窗里列出
+        self._dupes_btn = QPushButton("重复文件")
+        self._dupes_btn.setObjectName("SettingsBtn")
+        self._dupes_btn.setIconSize(QSize(15, 15))
+        self._dupes_btn.clicked.connect(self._on_find_duplicates)
+        sl.addWidget(self._dupes_btn)
+
         main_layout.addWidget(search_wrapper)
 
         # ── 主体：侧边栏 + 文件区 ──
@@ -807,6 +814,8 @@ class Dashboard(QMainWindow):
         self._refresh_btn.setIcon(icons.refresh(TEXT_SECONDARY))
         if hasattr(self, "_settings_btn"):
             self._settings_btn.setIcon(icons.settings(ACCENT))
+        if hasattr(self, "_dupes_btn"):
+            self._dupes_btn.setIcon(icons.search(ACCENT))
         if hasattr(self, "_add_cat_btn"):
             self._add_cat_btn.setIcon(icons.plus(ACCENT))
 
@@ -1443,6 +1452,47 @@ class Dashboard(QMainWindow):
         self._file_count_label.setText(f"搜索到 {len(all_results)} 个文件")
 
     # ═══════════════════════════════════════════════════════
+    # 重复文件检测（AW-22）
+    # ═══════════════════════════════════════════════════════
+
+    def _on_find_duplicates(self):
+        """
+        扫描所有分类目录，找出内容相同的文件并在弹窗里列出。
+
+        分组逻辑全在 `file_manager.find_duplicates`（可单测、只读、不整盘哈希）；
+        本方法只负责「转圈提示 + 弹窗 + 刷新」。删除走 `_send_to_recycle_bin`
+        （进回收站，不永久删除）。
+        """
+        from file_manager import find_duplicates
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            groups = find_duplicates(self.config)
+        except Exception as e:  # 扫描不该把界面打崩
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "错误", f"扫描重复文件失败：{e}")
+            return
+        QApplication.restoreOverrideCursor()
+
+        if not groups:
+            QMessageBox.information(
+                self, "重复文件", "没有找到内容相同的文件。\n\n"
+                "（只扫描各分类目录下的顶层文件，不含子文件夹）"
+            )
+            return
+
+        dlg = _DuplicateDialog(
+            groups,
+            size_formatter=self._format_size,
+            delete_func=_send_to_recycle_bin,
+            parent=self,
+        )
+        dlg.exec_()
+        # 用户可能删掉了文件 → 刷新当前分类与状态栏
+        self.refresh_current()
+        self._update_status()
+
+    # ═══════════════════════════════════════════════════════
     # 文件操作
     # ═══════════════════════════════════════════════════════
 
@@ -1664,38 +1714,156 @@ def _send_to_recycle_bin(file_path):
     必须靠 `fAnyOperationsAborted` 区分，否则会把「取消」当成删除成功、
     界面显示删了实际没删）；真正的 API 错误仍抛 OSError。
 
-    标志位与结果判定都抽到了 file_manager 的纯函数里（可单测）。
+    ⚠️ AW-22：实现已移到 `file_manager.send_to_recycle_bin`（无 PyQt5 依赖、可单测），
+    这里保留同名薄封装，既有调用点（`_on_delete_files`）行为不变；
+    重复文件窗口（`_DuplicateDialog`）也复用同一个入口，**全仓只有一个删除实现**。
     """
-    import ctypes
-    from ctypes import wintypes
-    from file_manager import build_delete_flags, interpret_delete_result
+    from file_manager import send_to_recycle_bin
+    return send_to_recycle_bin(file_path)
 
-    # 需要双终止符
-    class SHFILEOPSTRUCTW(ctypes.Structure):
-        _fields_ = [
-            ("hwnd", wintypes.HWND),
-            ("wFunc", wintypes.UINT),
-            ("pFrom", ctypes.c_wchar_p),
-            ("pTo", ctypes.c_wchar_p),
-            ("fFlags", wintypes.USHORT),
-            ("fAnyOperationsAborted", wintypes.BOOL),
-            ("hNameMappings", ctypes.c_void_p),
-            ("lpszProgressTitle", ctypes.c_wchar_p),
-        ]
 
-    FO_DELETE = 3
+class _DuplicateDialog(QDialog):
+    """
+    重复文件窗口（AW-22）：列出「组 → 文件（名称 / 大小 / 所在分类）」。
 
-    shfile = SHFILEOPSTRUCTW()
-    shfile.hwnd = None
-    shfile.wFunc = FO_DELETE
-    shfile.pFrom = file_path + "\0\0"
-    shfile.pTo = None
-    shfile.fFlags = build_delete_flags()
+    删除**复用** `_send_to_recycle_bin`（即 `file_manager.send_to_recycle_bin`），
+    进回收站而不是永久删除；批量删除与结果统计走 `file_manager.delete_duplicates`
+    （纯逻辑部分有单测，见 tests/test_duplicates.py）。
 
-    result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(shfile))
-    if not interpret_delete_result(result, shfile.fAnyOperationsAborted):
-        if shfile.fAnyOperationsAborted:
-            # 用户主动取消：不算错误，只是没删，别计入成功数。
-            return False
-        raise OSError(f"SHFileOperation failed with code {result}")
-    return True
+    ⚠️ 本类是 GUI 代码，**没有行为测试**（PyQt5 不在测试环境里 import），
+    只做 `py_compile` 静态检查——这一点在 AUTOWORK.md 的 AW-22 条目里如实写明。
+    """
+
+    def __init__(self, groups, size_formatter, delete_func, parent=None):
+        super().__init__(parent)
+        self._groups = groups
+        self._format_size = size_formatter
+        self._delete_func = delete_func
+
+        self.setWindowTitle("重复文件")
+        self.setMinimumSize(720, 480)
+        self.resize(820, 560)
+        if parent is not None and hasattr(parent, "_settings_dialog_style"):
+            self.setStyleSheet(parent._settings_dialog_style())
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        total_files = sum(len(g.entries) for g in groups)
+        reclaimable = sum(g.size * (len(g.entries) - 1) for g in groups)
+        info = QLabel(
+            f"找到 {len(groups)} 组重复文件，共 {total_files} 个文件，"
+            f"清理多余副本可释放约 {self._format_size(reclaimable)}。\n"
+            f"每组保留哪个由你决定——删除会移入回收站，可随时还原。"
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        self._tree = QTreeWidget()
+        self._tree.setColumnCount(3)
+        self._tree.setHeaderLabels(["文件", "大小", "所在分类"])
+        self._tree.setRootIsDecorated(True)
+        self._tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self._tree.setIndentation(16)
+        header = self._tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.Fixed)
+        header.resizeSection(1, 90)
+        header.resizeSection(2, 110)
+        layout.addWidget(self._tree, 1)
+
+        self._populate()
+
+        btn_row = QHBoxLayout()
+        self._delete_btn = QPushButton("删除选中（移入回收站）")
+        self._delete_btn.setObjectName("DeleteBtn")
+        self._delete_btn.clicked.connect(self._on_delete_selected)
+        btn_row.addWidget(self._delete_btn)
+        btn_row.addStretch()
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+    # ── 渲染 ──
+
+    def _populate(self):
+        """把分组渲染成「组 → 文件」两层树。"""
+        self._tree.clear()
+        for idx, group in enumerate(self._groups, start=1):
+            parent = QTreeWidgetItem()
+            parent.setText(
+                0,
+                f"组 {idx} · {len(group.entries)} 个文件 · "
+                f"每个 {self._format_size(group.size)}",
+            )
+            parent.setToolTip(0, f"sha256: {group.digest}")
+            parent.setFlags(Qt.ItemIsEnabled)  # 组标题本身不可选中（选的是文件）
+            for entry in group.entries:
+                child = QTreeWidgetItem(parent)
+                child.setText(0, entry.name)
+                child.setText(1, self._format_size(entry.size))
+                child.setText(2, entry.category)
+                child.setData(0, Qt.UserRole, entry.path)
+                child.setToolTip(0, f"{entry.path}\nsha256: {group.digest}")
+                child.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self._tree.addTopLevelItem(parent)
+        self._tree.expandAll()
+
+    def _selected_paths(self):
+        paths = []
+        for item in self._tree.selectedItems():
+            fp = item.data(0, Qt.UserRole)
+            if fp:
+                paths.append(fp)
+        return paths
+
+    def _remove_paths(self, paths):
+        """把已删除的文件从树上摘掉；组里剩不到 2 个就把整组移除。"""
+        gone = set(paths)
+        for i in range(self._tree.topLevelItemCount() - 1, -1, -1):
+            parent = self._tree.topLevelItem(i)
+            for j in range(parent.childCount() - 1, -1, -1):
+                child = parent.child(j)
+                if child.data(0, Qt.UserRole) in gone:
+                    parent.removeChild(child)
+            if parent.childCount() < 2:
+                self._tree.takeTopLevelItem(i)
+
+    # ── 删除 ──
+
+    def _on_delete_selected(self):
+        from file_manager import delete_duplicates
+
+        paths = self._selected_paths()
+        if not paths:
+            QMessageBox.information(self, "提示", "请先选中要删除的重复文件。")
+            return
+
+        names = "\n".join(f"  • {os.path.basename(p)}" for p in paths)
+        reply = QMessageBox.question(
+            self, "确认删除",
+            f"确定要删除选中的 {len(paths)} 个文件？\n\n{names}\n\n"
+            f"文件将被移入回收站（可还原）。",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        stats = delete_duplicates(paths, self._delete_func)
+        self._remove_paths(paths)
+
+        msg = f"已移入回收站 {stats.deleted} 个。"
+        if stats.cancelled:
+            msg += f"\n取消 {stats.cancelled} 个（未删除）。"
+        if stats.failed:
+            detail = "\n".join(f"  • {os.path.basename(p)}：{err}"
+                               for p, err in stats.errors)
+            msg += f"\n失败 {stats.failed} 个：\n{detail}"
+        QMessageBox.information(self, "删除结果", msg)
+
+        if self._tree.topLevelItemCount() == 0:
+            self.accept()
