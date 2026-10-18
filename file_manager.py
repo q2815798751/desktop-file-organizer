@@ -1057,14 +1057,19 @@ def arrange_desktop_icons():
 # 候选才去读内容算 sha256（尺寸不同的文件内容一定不同，没必要读）。这样常见的
 # 「一堆各不相同的文件」场景只做 N 次 `getsize`，不读任何文件内容。
 #
-# ⚠️ 空文件（0 字节）**照常参与**：两个 0 字节文件内容确实相同，是合法的重复组
-# （sha256 是空串的固定值）。不因为「大小为 0 看着像异常」就把它们排除——
-# 那会让「清理空文件」这个常见诉求失效。
+# ⚠️ 空文件（0 字节）**不算重复**（产品决策，2026-10-18 用户拍板）：0 字节文件里
+# 没有内容可丢，把它们报成「重复」只会制造噪音（系统里常有 `.gitkeep`、
+# 各种占位文件），用户真正想清的是**有内容**的副本。故 `size_groups` 直接
+# 丢掉 `st_size == 0` 的条目，它们连哈希都不会算（见 `MIN_DUPLICATE_SIZE`）。
 #
-# ⚠️ 扫描范围：各分类目录下的**顶层普通文件**（不递归子文件夹）。原因：递归要处理
-# 子目录里的 junction / 符号链接逃逸（会读到存储根之外），代价与风险都更高；
-# 而重复文件的主要来源就是收纳进来的顶层文件。这条限制写在 `category_files` 里。
+# ⚠️ 扫描范围：各分类目录下的**全部普通文件，含子文件夹（递归）**（2026-10-18
+# 用户拍板由「只扫顶层」改为递归）。递归必须防 **junction / 符号链接逃逸**：
+# 若某个子目录是指向存储根之外的链接，递归会读到用户其它目录的内容。
+# 因此 `_files_under` 对**每个条目**做 `os.path.realpath` 复检，解析到存储根
+# 之外的整棵子树一律跳过（记 WARNING），并顺带用「已访问的 realpath 集合」防环
+# （junction 指回祖先时不会无限递归）。见 `_real_inside` / `_files_under`。
 DUPLICATE_CHUNK_SIZE = 1024 * 1024  # 算哈希时每次读取的字节数（1 MiB）
+MIN_DUPLICATE_SIZE = 1  # 小于该大小的文件不参与重复检测（0 字节空文件不算重复）
 
 # 重复组里的一个文件：路径 / 显示名 / 大小（字节）/ 所在分类名
 DuplicateEntry = namedtuple("DuplicateEntry", ["path", "name", "size", "category"])
@@ -1106,6 +1111,8 @@ def size_groups(paths, getsize=os.path.getsize):
 
     ⚠️ 这是「不整盘哈希」这条性能前提的落点：**大小唯一的文件直接出局**，
     永远不会进入后续的哈希阶段（见 `find_duplicate_groups` 的用例）。
+    ⚠️ **0 字节空文件也直接出局**（`size < MIN_DUPLICATE_SIZE`）：空文件不算重复
+    （产品决策，见本节的说明）——它们连哈希都不会算。
     读不到大小的路径（已被删除 / 权限不足）直接跳过，不让它拖垮整次扫描。
     """
     buckets = {}
@@ -1114,6 +1121,8 @@ def size_groups(paths, getsize=os.path.getsize):
             size = getsize(p)
         except OSError:
             continue
+        if size < MIN_DUPLICATE_SIZE:
+            continue  # 空文件不算重复
         buckets.setdefault(size, []).append(p)
     return [(s, sorted(buckets[s])) for s in sorted(buckets) if len(buckets[s]) > 1]
 
@@ -1132,6 +1141,8 @@ def find_duplicate_groups(paths, getsize=os.path.getsize, hasher=file_sha256):
 
     ⚠️ 「同大小不同内容」**不会**被误报：它们尺寸相同但哈希不同 → 分到不同组，
     各自只有 1 个成员 → 不是重复组（用例 `test_same_size_different_content_is_not_a_group`）。
+    ⚠️ **0 字节空文件不算重复**（在 `size_groups` 就被丢掉，连哈希都不算）——
+    见本节开头的说明与 `MIN_DUPLICATE_SIZE`。
     """
     groups = []
     for size, candidates in size_groups(paths, getsize=getsize):
@@ -1148,36 +1159,104 @@ def find_duplicate_groups(paths, getsize=os.path.getsize, hasher=file_sha256):
     return groups
 
 
+def _real_inside(root_real, path):
+    """
+    只读判定：`path` 经 `os.path.realpath` 解析后是否**严格落在** `root_real` 之内。
+
+    ⚠️ 这是递归扫描的**安全闸门**（2026-10-18 用户拍板改成递归子文件夹后新增）：
+    分类目录里若存在指向存储根之外的 **junction / 符号链接**，递归会一路读到用户
+    别的目录（`C:\\`、另一个盘、同步软件的目录……），把这些文件当成「重复文件」
+    列出来甚至删掉。词法路径看不出问题，只有 `realpath` 能看穿链接。
+
+    - `root_real` 必须是**已经 realpath 过的**存储根（调用方算好，避免每层重复解析）；
+    - 解析失败 / 不同盘符（`commonpath` 抛 `ValueError`）→ 判为「不在内」；
+    - `real == root_real` 也判为「不在内」（存储根本身不是「它里面的条目」）。
+
+    ⚠️ 参数顺序沿用 `storage_ancestor_error` 的约定（被比较者在前），
+    `commonpath` 大小写不敏感、返回值取 `paths[0]` 的写法，故与 `root_real` 直接比较。
+    """
+    try:
+        real = os.path.realpath(path)
+        common = os.path.commonpath([root_real, real])
+    except (ValueError, OSError):
+        return False
+    return common == root_real and real != root_real
+
+
+def _files_under(folder, root_real, category_name):
+    """
+    只读：**递归**列出 `folder` 下的普通文件 → `[(full_path, category_name), ...]`。
+
+    逐层用 `_real_inside` 复检：
+    - 目录解析到存储根之外（junction / 符号链接逃逸）→ **跳过整棵子树**并记 WARNING；
+    - 文件解析到存储根之外（指向根外的文件符号链接）→ 跳过该文件并记 WARNING；
+    - 列目录失败（权限 / 采样途中被删）→ 跳过该目录并记 WARNING。
+
+    另用「已访问 realpath 集合」**防环**：junction 指回祖先（或自己）时，
+    第二次遇到同一个真实目录会直接跳过，不会无限递归。
+
+    本函数**绝不写文件系统**，只做 `listdir` / `isdir` / `isfile` / `realpath`。
+    """
+    found = []
+    seen = set()
+    stack = [folder]
+
+    while stack:
+        current = stack.pop()
+        real_current = os.path.realpath(current)
+        if real_current in seen:
+            continue  # 环（junction 指回已访问的目录）
+        if not _real_inside(root_real, current):
+            logger.warning(
+                "跳过解析到存储目录之外的链接（重复文件扫描不越界）：%s", current
+            )
+            continue
+        seen.add(real_current)
+
+        try:
+            entries = os.listdir(current)
+        except OSError as e:
+            logger.warning(
+                "扫描重复文件时列目录失败，已跳过：%s（原因：%s）", current, e
+            )
+            continue
+
+        for entry in entries:
+            full = os.path.join(current, entry)
+            if os.path.isdir(full):
+                stack.append(full)
+            elif os.path.isfile(full):
+                if _real_inside(root_real, full):
+                    found.append((full, category_name))
+                else:
+                    logger.warning(
+                        "跳过解析到存储目录之外的文件链接：%s", full
+                    )
+    return found
+
+
 def category_files(config):
     """
-    只读：列出各分类目录下的**顶层普通文件** → `[(full_path, category_name), ...]`。
+    只读：列出各分类目录下的**全部普通文件（递归子文件夹）**
+    → `[(full_path, category_name), ...]`。
 
     - 坏配置的分类（`folder` 越界 / junction 逃逸）由 `safe_category_folder` 跳过
       （记 ERROR 日志，不抛异常，与 AW-19 的「可见降级」一致）；
-    - 目录不存在 → 跳过；列目录失败（权限/被删）→ 跳过并记 WARNING；
-    - **不递归子目录**：见本模块「重复文件检测」一节的说明。
+    - 目录不存在 → 跳过；
+    - 递归时的 junction / 符号链接逃逸、列目录失败、环 → 见 `_files_under`（跳过并记日志）。
 
-    本函数**绝不写文件系统**，只 `isdir` / `listdir` / `isfile`。
+    本函数**绝不写文件系统**，只 `isdir` / `listdir` / `isfile` / `realpath`。
     """
     out = []
+    root_real = os.path.realpath(get_storage_root(config))
     for cat in config.get("categories", []) or []:
         folder = safe_category_folder(config, cat)
         if folder is None:
             continue
         if not os.path.isdir(folder):
             continue
-        try:
-            entries = os.listdir(folder)
-        except OSError as e:
-            logger.warning(
-                "扫描重复文件时列目录失败，已跳过：%s（原因：%s）", folder, e
-            )
-            continue
         cat_name = cat.get("name", "?") if isinstance(cat, dict) else "?"
-        for entry in entries:
-            full = os.path.join(folder, entry)
-            if os.path.isfile(full):
-                out.append((full, cat_name))
+        out.extend(_files_under(folder, root_real, cat_name))
     return out
 
 
@@ -1188,9 +1267,10 @@ def find_duplicates(config, getsize=os.path.getsize, hasher=file_sha256):
 
     「跨分类重复」天然被覆盖：扫描是**跨分类统一分组**的，同一个文件出现在哪个分类
     只影响 `DuplicateEntry.category` 这个展示字段，不影响它跟别的分类里的同内容文件
-    归到同一组。
+    归到同一组。**子文件夹里的文件同样参与**（递归扫描，见 `category_files`），
+    所以「同一个文件被收纳到不同子文件夹」也能被找出来。
 
-    ⚠️ 只读：不移动、不删除、不改配置。
+    ⚠️ 只读：不移动、不删除、不改配置。**0 字节空文件不算重复。**
     """
     files = category_files(config)
     category_of = {path: cat for path, cat in files}

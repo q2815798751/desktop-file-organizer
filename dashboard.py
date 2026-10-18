@@ -1477,7 +1477,7 @@ class Dashboard(QMainWindow):
         if not groups:
             QMessageBox.information(
                 self, "重复文件", "没有找到内容相同的文件。\n\n"
-                "（只扫描各分类目录下的顶层文件，不含子文件夹）"
+                "（扫描各分类目录下的全部文件，含子文件夹；0 字节空文件不算重复）"
             )
             return
 

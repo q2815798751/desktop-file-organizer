@@ -1316,6 +1316,55 @@
       CI 的 Windows Server 不把带绝对路径前缀的保留设备名解析成设备路径——环境差异，
       非本项引入；本机照常实跑）。
 
+      **2026-10-18 补充（用户对两条产品决策拍板后的改动）**：实际 **341** 个用例
+      （331 → 341，净增 10 条，全在 `tests/test_duplicates.py`），
+      `python -m unittest discover -s tests -v` 全绿（本机 1 skip，见下）。
+      1. **扫描范围改为递归子文件夹**（原「只扫顶层」被推翻）。递归必须防
+         **junction / 符号链接逃逸**，否则会把存储根之外的用户目录读进来、甚至当重复文件删掉。
+         新增 `_real_inside(root_real, path)`（**只读判定**：`os.path.realpath` 解析后是否
+         **严格落在**存储根内；`commonpath` 抛 `ValueError`/`OSError` → 判为不在内；
+         `real == root` 也判为不在内）与 `_files_under(folder, root_real, category_name)`
+         （栈式递归：**逐条目** realpath 复检 → 解析到根外的**整棵子树跳过**并记 WARNING；
+         文件链接指向根外同样跳过；列目录失败跳过并记 WARNING；另用「已访问 realpath 集合」
+         **防环**——junction 指回祖先时不会无限递归）。`category_files` 只负责算一次
+         `root_real = realpath(get_storage_root(config))` 再逐分类交给 `_files_under`。
+      2. **0 字节空文件不算重复**（新增 `MIN_DUPLICATE_SIZE = 1`，在 `size_groups` 里
+         `size < MIN_DUPLICATE_SIZE` 直接跳过）：空文件没有内容可清，报出来只是噪音
+         （`.gitkeep`、占位文件）。**原有 3 条「空文件成组」的用例已改写**为断言
+         「空文件不出现在结果里」（`test_empty_files_are_not_candidates` /
+         `test_empty_files_are_not_a_group` / `test_empty_files_across_categories_are_not_reported`），
+         并补了 3 条配套（1 字节仍算候选、空文件一次都没被哈希、空文件不掩盖真实重复）。
+         README 与 `_on_find_duplicates` 的提示文案同步改写。
+      新增 10 条用例：`test_recurses_into_subdirectories`（含两层深）、
+      `test_duplicates_across_subfolders_are_one_group`（跨子文件夹 + 跨分类归一组）、
+      `test_one_byte_file_is_still_a_candidate`、`test_empty_files_are_never_hashed`、
+      `test_empty_files_do_not_hide_real_duplicates`、
+      `TestCategoryFilesJunctionEscape` 6 条（`_real_inside` 纯逻辑、
+      **真实 `mklink /J` 指向根外 → 跳过整棵子树且根外文件一字节没少**、
+      端到端「根外同内容文件不得被报成重复」、**junction 指回祖先的环必须终止**、
+      文件符号链接指向根外被跳过、以及无符号链接权限环境下的**打桩 realpath 确定性覆盖**）。
+      反向验证（**三组定点破坏**，每组先 `git diff | grep BREAK` 确认破坏生效）：
+      (D) 把 `_real_inside` 改成恒 `True`（取消 realpath 越界复检）→ 重跑得 **4 failed**
+          （三条 junction/链接用例 + `_real_inside` 纯逻辑用例）；**并用真实 `mklink /J`
+          实测复现了泄露**：扫描结果里出现 `storage\图片\外部链接\SECRET.txt`，
+          其 `realpath` 落在存储根之外（`outside\SECRET.txt`）——即根外文件真的被扫进来了；
+      (E) 把 `size < MIN_DUPLICATE_SIZE` 改成恒假（恢复「空文件也算重复」）→ 重跑得
+          **5 failed**，正是 5 条空文件用例；
+      (F) 取消「已访问 realpath 集合」的环保护 → 重跑得 **1 failed**
+          （`test_junction_cycle_terminates`，计数桩在 50 次 listdir 时抛
+          「扫描没有终止——环保护失效」，**0.1 秒变红而不是挂死**）。
+      装回后 `grep BREAK` 0 命中、恢复 341 全绿。
+      ⚠️ **本轮自查发现并修掉的一个弱断言（值得记一笔）**：junction 用例最初用
+      「结果里不含根外路径 / 不含 `SECRET` 绝对路径」做断言——**这抓不到泄露**，
+      因为泄露出来的条目路径**长得像在存储根内**（`存储根\图片\外部链接\SECRET.txt`），
+      与真实根外路径**字符串不相等**。已改为按 **realpath 判「解析后是否仍在根内」**
+      并断言文件名里不出现 `SECRET.txt`，破坏 (D) 时它才真的变红（见上）。
+      （这正是 AW-21 记过的同一类教训：**检查动作发生了，但检查的不是你以为的东西**。）
+      本机那 1 条 skip 是 `test_symlink_to_outside_file_is_skipped`——本机普通用户
+      **没有创建符号链接的权限**（实测 WinError 1314，与 AW-9 的记录一致），故该用例
+      `skipTest`；它覆盖的文件链接分支由上面那条**打桩 realpath** 的确定性用例兜住，
+      junction 路径则由真实 `mklink /J` 用例实跑覆盖（**非 skip**）。
+
 - [ ] **AW-23 批量操作**（新功能）
       目标：仪表盘支持多选（Ctrl/Shift）后批量「移动到分类」/「删除」。
       要求：操作前弹确认框写明数量与目标；结束后汇报成功/失败条数；失败要能说出是哪个文件
